@@ -3,7 +3,8 @@
 A Streamlit webapp for dynamic evaluation of the **employee attrition model** take-home task.
 The quiz-taker uploads the Jupyter notebook they submitted; an OpenAI model generates a fixed,
 10-question quiz grounded in that specific notebook; answers are scored against the generated
-key and the model writes an evaluator-facing report.
+key and shown in a per-question breakdown. There is no time limit — a stopwatch just tracks
+how long the candidate takes.
 
 ## How it works
 
@@ -11,16 +12,18 @@ key and the model writes an evaluator-facing report.
    and (truncated) cell outputs into a transcript.
 2. **Generate** — the model generates 8 questions in one batch call, following a fixed
    template (see below) so difficulty and coverage are consistent across notebooks and
-   runs. JSON-mode output plus Pydantic validation guarantee well-formed questions.
-3. **Quiz** — questions are presented one at a time under a countdown timer (default 5
-   minutes); it auto-submits when time expires. Two questions (the model/metric
+   runs. JSON-mode output plus Pydantic validation guarantee well-formed questions. The
+   correct answer and explanation are generated up front along with the question, but
+   never shown to the candidate until the final breakdown.
+3. **Quiz** — questions are presented one at a time; a stopwatch (not a countdown) shows
+   elapsed time, with no limit and no auto-submit. Two questions (the model/metric
    follow-ups) are generated live, right after the candidate answers the model-choice
    and metric-choice questions, so they test *why* the candidate's own pick was
    appropriate — not a generic recall question. Unanswered questions score zero.
-4. **Report** — the score is computed against the answer key, and the model writes a
-   short evaluator report (overall assessment, understanding by topic, suggested live
-   follow-up questions). Results — including per-question time spent — are downloadable
-   as JSON.
+4. **Results** — the score is computed against the answer key and shown as a
+   per-question breakdown (your answer, the correct answer, why, and time spent on
+   that question). Results — including per-question time spent — are downloadable as
+   JSON.
 
 ## Question template (fixed, 10 slots in order)
 
@@ -54,8 +57,8 @@ The app opens at http://localhost:8501.
 
 ## Configuration
 
-- **Time limit** (1–15 min, default 5) is in the sidebar on the upload screen. Question
-  count is fixed at 10 (8 generated up front + 2 live follow-ups) to match the template.
+- Question count is fixed at 10 (8 generated up front + 2 live follow-ups) to match
+  the template — there's no time limit or question-count setting to configure.
 - The per-slot instructions live in `SLOT_INSTRUCTIONS` in `app.py`; the task description
   shown to the model is in `TASK_CONTEXT`.
 - `MODEL` in `app.py` defaults to `gpt-4o`; swap to `gpt-4o-mini` for cheaper/faster
@@ -64,8 +67,8 @@ The app opens at http://localhost:8501.
 ## Notes
 
 - All API calls share an identical system prompt and lead with the same notebook text,
-  so OpenAI's automatic prompt-prefix caching can apply across the batch, follow-up, and
-  grading calls.
+  so OpenAI's automatic prompt-prefix caching can apply across the batch and follow-up
+  calls.
 - The two follow-up questions (slots 4 and 7) are generated mid-quiz, based on the
   candidate's own answer to the preceding question — if they left that question
   unanswered, the follow-up falls back to asking about the notebook's actual choice

@@ -1,10 +1,11 @@
-"""Notebook Quiz — a timed comprehension quiz generated from an uploaded Jupyter notebook.
+"""Notebook Quiz — a comprehension quiz generated from an uploaded Jupyter notebook.
 
 A candidate uploads the attrition-model notebook they submitted; the model generates
 a fixed 10-question quiz grounded in that specific notebook (two of the questions are
 dynamic follow-ups generated from the candidate's own live answer); the candidate
-answers one question at a time under a countdown; answers are scored against the
-generated key and the model writes an evaluator-facing report.
+answers one question at a time while a stopwatch (not a countdown — there is no time
+limit) tracks elapsed time; correct answers are never revealed until the final
+question breakdown.
 
 Run with:  streamlit run app.py
 Auth:      set OPENAI_API_KEY (e.g. in a local .env file).
@@ -132,7 +133,7 @@ and stated production considerations.
 - Each question must be answerable in about 45-60 seconds without re-running code.
 - Do NOT ask trivia (import order, variable names, library versions).
 - topic: a 2-4 word tag. explanation: 1-3 sentences on why the correct answer is \
-right, written for the evaluator's report.
+right, shown to the candidate in the question breakdown after they finish.
 - Distractors must be plausible — they mix up related concepts from the same \
 notebook — but clearly wrong to someone who understands the work.
 """
@@ -338,59 +339,6 @@ matching this exact shape:
     return q
 
 
-def generate_report(
-    client: OpenAI,
-    notebook_text: str,
-    questions: list[QuizQuestion],
-    answers: list,
-    elapsed_seconds: float,
-) -> str:
-    results = []
-    for q, a in zip(questions, answers):
-        results.append({
-            "topic": q.topic,
-            "question": q.question,
-            "options": q.options,
-            "correct_answer": q.options[q.correct_index],
-            "candidate_answer": q.options[a] if a is not None else None,
-            "answered_correctly": a == q.correct_index,
-            "why_correct": q.explanation,
-        })
-    score = sum(r["answered_correctly"] for r in results)
-    instructions = f"""\
-The candidate just completed a timed comprehension quiz about the notebook above. \
-Score: {score}/{len(results)}. Time used: {elapsed_seconds:.0f} seconds. \
-Full results:
-
-{json.dumps(results, indent=2)}
-
-Write a concise evaluator-facing report in markdown (under 400 words) with:
-1. **Overall assessment** — does the candidate appear to genuinely understand \
-their submission? Unanswered questions usually mean they ran out of time.
-2. **Understanding by topic** — where they showed command vs. gaps, referencing \
-specific wrong answers and what the mistake suggests. Pay particular attention to \
-the two follow-up questions (model/metric rationale) — these reveal whether the \
-candidate understands *why* their choices were appropriate, not just *what* they \
-chose.
-3. **Suggested follow-ups** — 2-3 targeted questions for a live conversation, \
-aimed at the weakest areas.
-Do not restate every question; synthesize.
-"""
-    user_content = f"{notebook_prompt_prefix(notebook_text)}\n\n{instructions}"
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    choice = response.choices[0]
-    if choice.finish_reason == "content_filter":
-        raise RuntimeError("The model declined to grade this quiz (content filter).")
-    return choice.message.content
-
-
 def call_with_errors_surfaced(fn, *args, **kwargs):
     """Run an API-calling function, converting SDK errors to readable messages."""
     try:
@@ -474,9 +422,7 @@ def finish_quiz():
     st.session_state.final_questions = final_q
     st.session_state.final_answers = final_a
     st.session_state.final_time_spent = final_t
-    st.session_state.elapsed = min(
-        st.session_state.quiz_seconds, time.time() - st.session_state.started_at
-    )
+    st.session_state.elapsed = time.time() - st.session_state.started_at
     st.session_state.stage = "results"
 
 
@@ -486,13 +432,10 @@ st.title("📝 Notebook Comprehension Quiz")
 if st.session_state.stage == "upload":
     st.markdown(
         "Upload the Jupyter notebook you submitted for the **employee attrition "
-        "model** task. A short timed quiz (10 questions, two of which are generated "
-        "live from your own answers) will check your understanding of your own "
-        "submission."
+        "model** task. A 10-question quiz (two of which are generated live from "
+        "your own answers) will check your understanding of your own submission. "
+        "A stopwatch tracks how long you take, but there's no time limit."
     )
-    with st.sidebar:
-        st.header("Settings")
-        minutes = st.slider("Time limit (minutes)", 1, 15, 5)
 
     uploaded = st.file_uploader("Notebook (.ipynb)", type=["ipynb"])
 
@@ -518,20 +461,13 @@ if st.session_state.stage == "upload":
             st.session_state.question_start_times = {}
             st.session_state.notebook_text = notebook_text
             st.session_state.current_index = 0
-            st.session_state.quiz_seconds = minutes * 60
             st.session_state.started_at = time.time()
-            st.session_state.deadline = time.time() + minutes * 60
             st.session_state.stage = "quiz"
             st.rerun()
 
 # ---- Stage: quiz ---------------------------------------------------------
 elif st.session_state.stage == "quiz":
     idx = st.session_state.current_index
-
-    if st.session_state.get("time_up"):
-        record_current_answer()
-        finish_quiz()
-        st.rerun()
 
     item = st.session_state.quiz_items[idx]
 
@@ -574,18 +510,12 @@ elif st.session_state.stage == "quiz":
         st.session_state.question_start_times[idx] = time.time()
 
     @st.fragment(run_every=1.0)
-    def countdown():
-        remaining = st.session_state.deadline - time.time()
-        if remaining <= 0:
-            st.session_state.time_up = True
-            st.rerun(scope="app")
-        mm, ss = divmod(int(max(remaining, 0)), 60)
-        st.metric("⏱️ Time remaining", f"{mm}:{ss:02d}")
-        if remaining <= 60:
-            st.warning("Less than a minute left — unanswered questions score zero.")
+    def stopwatch():
+        elapsed = time.time() - st.session_state.started_at
+        mm, ss = divmod(int(elapsed), 60)
+        st.metric("⏱️ Time elapsed", f"{mm}:{ss:02d}")
 
-    countdown()
-    st.caption("The quiz auto-submits when the timer runs out.")
+    stopwatch()
     st.divider()
 
     st.subheader(f"Question {idx + 1} of {len(st.session_state.quiz_items)}")
@@ -619,23 +549,6 @@ elif st.session_state.stage == "results":
     col1.metric("Score", f"{score} / {total}")
     col2.metric("Time used", f"{st.session_state.elapsed:.0f}s")
 
-    if "report" not in st.session_state:
-        with st.spinner("Grading and writing the evaluator report…"):
-            report = call_with_errors_surfaced(
-                generate_report,
-                get_client(),
-                st.session_state.notebook_text,
-                questions,
-                answers,
-                st.session_state.elapsed,
-            )
-        if report is not None:
-            st.session_state.report = report
-
-    if "report" in st.session_state:
-        st.markdown("## Evaluator report")
-        st.markdown(st.session_state.report)
-
     st.markdown("## Question breakdown")
     for i, (q, a, t) in enumerate(zip(questions, answers, time_spent)):
         correct = a == q.correct_index
@@ -651,7 +564,6 @@ elif st.session_state.stage == "results":
         "score": score,
         "total": total,
         "elapsed_seconds": round(st.session_state.elapsed, 1),
-        "report": st.session_state.get("report"),
         "questions": [
             {
                 "slot": q.slot,
