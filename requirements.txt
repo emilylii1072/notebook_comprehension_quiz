@@ -1,5 +1,5 @@
 streamlit>=1.37
-anthropic>=0.40
+openai>=1.50
 nbformat>=5.9
 pydantic>=2.0
 python-dotenv>=1.0
