@@ -447,7 +447,11 @@ def record_current_answer():
     """Save the radio selection (and elapsed time) for the current question index."""
     idx = st.session_state.current_index
     item = st.session_state.quiz_items[idx]
-    if isinstance(item, QuizQuestion):
+    # Streamlit re-executes the whole script (including class definitions) on every
+    # rerun, so a QuizQuestion instance stored in session_state from an earlier rerun
+    # is never `isinstance` of *this* rerun's freshly-defined QuizQuestion class.
+    # Check against the stable builtin `dict` (the placeholder marker) instead.
+    if not isinstance(item, dict):
         selected = st.session_state.get(f"q{idx}")
         st.session_state.answers[idx] = (
             item.options.index(selected) if selected in item.options else None
@@ -463,7 +467,7 @@ def finish_quiz():
     for it, a, t in zip(
         st.session_state.quiz_items, st.session_state.answers, st.session_state.time_spent
     ):
-        if isinstance(it, QuizQuestion) and it.topic != "skipped":
+        if not isinstance(it, dict) and it.topic != "skipped":
             final_q.append(it)
             final_a.append(a)
             final_t.append(t)
@@ -539,7 +543,7 @@ elif st.session_state.stage == "quiz":
         trigger_answer_idx = st.session_state.answers[idx - 1]
         chosen_label = (
             trigger_item.options[trigger_answer_idx]
-            if isinstance(trigger_item, QuizQuestion) and trigger_answer_idx is not None
+            if not isinstance(trigger_item, dict) and trigger_answer_idx is not None
             else None
         )
         with st.spinner("Generating a follow-up based on your answer…"):
