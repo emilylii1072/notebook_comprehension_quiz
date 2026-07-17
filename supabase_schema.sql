@@ -1,0 +1,74 @@
+create table if not exists quiz_results (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  candidate_name text,
+  notebook_filename text,
+  score integer not null,
+  total integer not null,
+  elapsed_seconds numeric,
+  -- Full per-question breakdown (question text, options, correct/candidate answers,
+  -- explanation, time spent) as a JSON array. Stored per-row rather than normalized
+  -- into a separate table for now, since the question set is still being iterated on.
+  questions jsonb not null
+);
+
+create index if not exists quiz_results_created_at_idx on quiz_results (created_at desc);
+create index if not exists quiz_results_candidate_name_idx on quiz_results (candidate_name);
+
+-- Row Level Security: enabled by default on new Supabase projects. The app writes
+-- using the service_role key (server-side only, bypasses RLS), so no policy is
+-- strictly required for the app to function -- but RLS stays ON so the anon/public
+-- key (if ever exposed) cannot read or write this table.
+alter table quiz_results enable row level security;
+
+-- A small, growing bank of "benefits and restrictions" questions for the model
+-- follow-up (asked about whichever model the candidate picked in the model_choice
+-- question). Seeded with the three models named in the take-home task; any other
+-- model a candidate picks (e.g. Support Vector Machine) gets a question generated
+-- on the fly by the LLM and saved here via upsert, so it's reused next time.
+create table if not exists model_followup_bank (
+  model_name text primary key,
+  options jsonb not null,       -- array of exactly 4 option strings
+  correct_index integer not null,
+  explanation text not null,
+  created_at timestamptz not null default now()
+);
+
+alter table model_followup_bank enable row level security;
+
+insert into model_followup_bank (model_name, options, correct_index, explanation)
+values
+  (
+    'Logistic Regression',
+    '[
+      "It provides probabilities and interpretable coefficients, but nonlinear relationships may require additional feature engineering.",
+      "It provides probabilities and interpretable coefficients, but only after combining predictions from many fitted trees.",
+      "It provides probabilities and nonlinear feature interactions automatically, but cannot show the direction of feature effects.",
+      "It provides probabilities and a flexible decision boundary, but usually requires extensive hyperparameter tuning."
+    ]'::jsonb,
+    0,
+    'Logistic Regression gives calibrated probabilities and coefficients whose sign/magnitude are directly interpretable, but it models a linear decision boundary -- capturing nonlinear relationships requires manual feature engineering (interactions, polynomial terms, binning).'
+  ),
+  (
+    'Random Forest',
+    '[
+      "Its trees are trained sequentially to correct earlier errors, but the learning rate requires careful tuning.",
+      "Its trees can capture nonlinear interactions and reduce instability through averaging, but the combined model is harder to explain.",
+      "Its trees produce one simple set of decision rules, but the model cannot estimate attrition probabilities.",
+      "Its trees work well only after all workplace features have been standardized to the same scale."
+    ]'::jsonb,
+    1,
+    'Random Forest averages many independently-trained trees, which captures nonlinear interactions and reduces the variance/instability of any single tree, at the cost of losing the single-tree interpretability of a simpler model.'
+  ),
+  (
+    'XGBoost',
+    '[
+      "Its boosting procedure uses regularization and computational optimizations, but tuning and explaining the final model can require additional effort.",
+      "Its boosting procedure trains all trees independently, but combining their predictions can require substantial memory.",
+      "Its boosting procedure captures nonlinear patterns, but requires every feature to be standardized and cannot handle missing values.",
+      "Its boosting procedure includes regularization, so overfitting and probability calibration do not need to be evaluated."
+    ]'::jsonb,
+    0,
+    'XGBoost builds trees sequentially with gradient boosting plus built-in regularization and engineering optimizations (handles missing values, parallelized), often giving strong tabular performance -- but that comes with more hyperparameters to tune and a less directly interpretable model.'
+  )
+on conflict (model_name) do nothing;
