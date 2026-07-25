@@ -72,3 +72,42 @@ values
     'XGBoost builds trees sequentially with gradient boosting plus built-in regularization and engineering optimizations (handles missing values, parallelized), often giving strong tabular performance -- but that comes with more hyperparameters to tune and a less directly interpretable model.'
   )
 on conflict (model_name) do nothing;
+
+
+-- ---------------------------------------------------------------------------
+-- Notebook grading (Notebook Grader tool)
+-- ---------------------------------------------------------------------------
+
+-- A rubric: the task description graded against, plus the rubric CSV stored VERBATIM
+-- (exactly as uploaded — the grader hands it to the model unparsed, so every column of
+-- guidance is preserved). Keyed by `name` so you can keep multiple rubrics and
+-- re-upload/replace one by name.
+create table if not exists grading_rubric (
+  name text primary key,
+  task text not null,
+  rubric_csv text not null,   -- the uploaded CSV, verbatim
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table grading_rubric enable row level security;
+
+-- One graded notebook: the flattened transcript plus ChatGPT's per-item scores and
+-- reasoning. Uniqueness on (rubric_name, notebook_filename) means re-uploading the
+-- same notebook under the same rubric re-grades it (upsert) rather than duplicating.
+create table if not exists graded_notebooks (
+  id uuid primary key default gen_random_uuid(),
+  rubric_name text not null references grading_rubric (name) on delete cascade,
+  notebook_filename text not null,
+  notebook_text text,
+  results jsonb not null,   -- [{"section","criterion","max_pts","score","reasoning"}, ...]
+  total_score numeric not null,
+  max_score numeric not null,
+  created_at timestamptz not null default now(),
+  unique (rubric_name, notebook_filename)
+);
+
+create index if not exists graded_notebooks_rubric_idx
+  on graded_notebooks (rubric_name, created_at desc);
+
+alter table graded_notebooks enable row level security;

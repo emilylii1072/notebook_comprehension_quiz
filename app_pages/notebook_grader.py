@@ -1,0 +1,488 @@
+"""Notebook Grader — grade many Jupyter notebooks against a rubric with ChatGPT.
+
+Workflow (three tabs):
+  1. Rubric & Task — upload a rubric CSV (or load a stored one) and review/edit the
+     task description. The rubric CSV is handed to the model VERBATIM (never reparsed
+     or transformed), so every column of grading guidance you wrote is used as-is.
+  2. Grade notebooks — upload one or many `.ipynb` files; each is flattened to a
+     transcript and sent to the OpenAI API, which reads the CSV rubric and returns a
+     score + reasoning for every rubric item it finds. Results are saved per-notebook.
+  3. Results — a summary table (section totals per notebook) and a details table
+     (every rubric item + reasoning), downloadable as a multi-sheet Excel workbook.
+
+One page of the multipage app — run the app via `streamlit run app.py`.
+Auth: set OPENAI_API_KEY (e.g. in a local .env file). Supabase is optional — without
+it the tool still grades and exports; it just won't persist across sessions.
+"""
+
+import io
+import json
+
+import nbformat
+import openai
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+from db import (
+    delete_all_graded_notebooks,
+    delete_graded_notebook,
+    get_graded_notebooks,
+    get_rubric,
+    list_rubrics,
+    save_graded_notebook,
+    save_rubric,
+)
+
+load_dotenv()
+
+MODEL = "gpt-4o"  # swap to "gpt-4o-mini" for cheaper/faster test iteration
+MAX_OUTPUT_CHARS_PER_CELL = 1500
+DEFAULT_RUBRIC_NAME = "attrition_v1"
+
+# The default task graded against — the employee-attrition take-home. Editable in the
+# UI, stored to Supabase alongside the rubric so every notebook is graded against the
+# exact task text that was in effect.
+DEFAULT_TASK = """\
+You have been tasked with a PM request to design and create an MVP employee attrition \
+model using Viva Insights data. The goal is to build a prototype that will inform \
+whether this feature is worth investing engineering resources.
+The PM is interested in understanding:
+1. If we were to create an employee attrition model, what would this look like?
+2. What would be the inputs and outputs of the model?
+3. What factors should we take into account when thinking about bringing this model \
+into production?
+A starter sample Person Query dataset (pq_data) is available via the vivainsights \
+Python package. Install via: pip install vivainsights.
+Note: this dataset is known to be incomplete. An attrition label column is missing and \
+will need to be engineered or simulated — identifying and addressing this gap is part \
+of the task.
+Your notebook should include:
+- Your recommended choice of attrition model algorithm and rationale
+- Code demonstrating how the model would run end-to-end
+- Example outputs from the model (predictions, feature importance, evaluation metrics)
+- A brief discussion of production considerations
+"""
+
+SYSTEM_PROMPT = (
+    "You are a meticulous, fair grader of data-science take-home notebooks."
+    "You never inflate scores, you award "
+    "partial credit where the work is partially done, and every score is justified by "
+    "concrete, specific reference to the notebook's content (cells, code, outputs, or "
+    "markdown)."
+)
+
+
+class GradedItem(BaseModel):
+    section: str = ""
+    criterion: str
+    max_pts: float
+    score: float
+    reasoning: str = ""
+
+
+class GradeResult(BaseModel):
+    items: list[GradedItem]
+
+
+# ---------------------------------------------------------------------------
+# Notebook parsing
+# ---------------------------------------------------------------------------
+
+def notebook_to_text(raw: bytes) -> str:
+    """Flatten a .ipynb into a text transcript of markdown, code, and outputs."""
+    nb = nbformat.reads(raw.decode("utf-8"), as_version=4)
+    parts = []
+    for i, cell in enumerate(nb.cells):
+        if cell.cell_type == "markdown":
+            parts.append(f"--- markdown cell {i} ---\n{cell.source}")
+        elif cell.cell_type == "code":
+            parts.append(f"--- code cell {i} ---\n{cell.source}")
+            out_texts = []
+            for out in cell.get("outputs", []):
+                text = ""
+                if out.get("output_type") == "stream":
+                    text = "".join(out.get("text", ""))
+                elif out.get("output_type") in ("execute_result", "display_data"):
+                    text = "".join(out.get("data", {}).get("text/plain", ""))
+                elif out.get("output_type") == "error":
+                    text = "\n".join(out.get("traceback", []))
+                if text:
+                    if len(text) > MAX_OUTPUT_CHARS_PER_CELL:
+                        text = text[:MAX_OUTPUT_CHARS_PER_CELL] + "\n[output truncated]"
+                    out_texts.append(text)
+            if out_texts:
+                parts.append(f"--- output of cell {i} ---\n" + "\n".join(out_texts))
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Grading (model call) — the rubric CSV is passed through verbatim, not parsed.
+# ---------------------------------------------------------------------------
+
+def grade_notebook(
+    client: OpenAI, task: str, rubric_csv: str, notebook_text: str
+) -> list[dict]:
+    """Score one notebook against the rubric CSV. The CSV text is given to the model
+    exactly as uploaded; the model reads it and returns one score + reasoning per
+    rubric item. Returns [{"section","criterion","max_pts","score","reasoning"}]."""
+    instructions = f"""\
+Below is a grading rubric, provided as the exact CSV file the grader uploaded. Read \
+the rubric yourself — use every column (point values, and any full/partial/low-credit \
+guidance) as written. Grade the notebook against it.
+
+For EACH scoreable rubric item (row) in the CSV, assign a numeric score between 0 and \
+that item's maximum points (fractional scores allowed) and write 1-3 sentences of \
+reasoning citing specific evidence from the notebook (or its absence). Be strict and \
+evidence-based: award the max only when the item is fully satisfied, partial credit \
+when partially satisfied, and 0 when absent. Copy the item's section name and maximum \
+points from the CSV verbatim.
+
+THE TASK THE NOTEBOOK WAS RESPONDING TO:
+{task}
+
+RUBRIC CSV (verbatim):
+```csv
+{rubric_csv}
+```
+
+Respond with ONLY a single JSON object (no markdown code fences, no commentary) of \
+the exact shape:
+{{"items": [{{"section": "<section from the CSV>", "criterion": "<short name of the \
+rubric item from the CSV>", "max_pts": <the item's max points from the CSV>, "score": \
+<number between 0 and max_pts>, "reasoning": "<1-3 sentences>"}}]}}
+Return one entry per scoreable rubric item, in the order they appear in the CSV."""
+
+    user_content = f"<notebook>\n{notebook_text}\n</notebook>\n\n{instructions}"
+    response = client.chat.completions.create(
+        model=MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+    )
+    choice = response.choices[0]
+    if choice.finish_reason == "content_filter":
+        raise RuntimeError("The model declined to grade this notebook (content filter).")
+    try:
+        parsed = GradeResult.model_validate(json.loads(choice.message.content))
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        raise RuntimeError(f"Could not parse grading JSON from the model: {e}") from e
+    if not parsed.items:
+        raise RuntimeError("The model returned no graded items — try again.")
+
+    results = []
+    for g in parsed.items:
+        max_pts = max(0.0, float(g.max_pts))
+        score = max(0.0, min(float(g.score), max_pts))  # clamp into [0, max]
+        results.append(
+            {
+                "section": g.section.strip() or "General",
+                "criterion": g.criterion.strip(),
+                "max_pts": max_pts,
+                "score": score,
+                "reasoning": g.reasoning,
+            }
+        )
+    return results
+
+
+def call_with_errors_surfaced(fn, *args, **kwargs):
+    """Run an API-calling function, converting SDK errors to readable messages."""
+    try:
+        return fn(*args, **kwargs)
+    except openai.AuthenticationError:
+        st.error(
+            "Authentication failed. Set the OPENAI_API_KEY environment variable "
+            "(e.g. in a local .env file) and restart the app."
+        )
+    except openai.RateLimitError:
+        st.error("Rate limited (or out of quota) — check your OpenAI plan/billing and try again.")
+    except openai.APIStatusError as e:
+        st.error(f"API error {e.status_code}: {e.message}")
+    except openai.APIConnectionError:
+        st.error("Could not reach the OpenAI API — check your network connection.")
+    except RuntimeError as e:
+        st.error(str(e))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Results tables + Excel export (built from the model's returned items)
+# ---------------------------------------------------------------------------
+
+def _section_order(graded: dict) -> list[str]:
+    """Sections in first-seen order across all graded notebooks."""
+    seen = []
+    for rec in graded.values():
+        for r in rec["results"]:
+            if r["section"] not in seen:
+                seen.append(r["section"])
+    return seen
+
+
+def _section_max(graded: dict, sections: list[str]) -> dict:
+    """Max points per section — summed per notebook, then the max across notebooks
+    (robust if one notebook's grading happened to drop or add an item)."""
+    section_max = {s: 0.0 for s in sections}
+    for rec in graded.values():
+        per_nb = {s: 0.0 for s in sections}
+        for r in rec["results"]:
+            per_nb[r["section"]] = per_nb.get(r["section"], 0.0) + float(r["max_pts"])
+        for s in sections:
+            section_max[s] = max(section_max[s], per_nb.get(s, 0.0))
+    return section_max
+
+
+def build_summary_df(graded: dict) -> pd.DataFrame:
+    """One row per notebook: per-section totals, grand total, max, percent."""
+    sections = _section_order(graded)
+    section_max = _section_max(graded, sections)
+    total_max = sum(section_max.values())
+
+    rows = []
+    for fname, rec in graded.items():
+        section_score = {s: 0.0 for s in sections}
+        for r in rec["results"]:
+            section_score[r["section"]] = section_score.get(r["section"], 0.0) + float(r["score"])
+        row = {"notebook": fname}
+        for s in sections:
+            row[f"{s} (/{section_max[s]:g})"] = round(section_score.get(s, 0.0), 2)
+        total = round(sum(section_score.values()), 2)
+        row["Total"] = total
+        row["Max"] = round(total_max, 2)
+        row["Percent"] = round(100 * total / total_max, 1) if total_max else 0.0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_details_df(graded: dict) -> pd.DataFrame:
+    """One row per (notebook, rubric item), with score and reasoning."""
+    rows = []
+    for fname, rec in graded.items():
+        for r in rec["results"]:
+            rows.append(
+                {
+                    "notebook": fname,
+                    "section": r["section"],
+                    "criterion": r["criterion"],
+                    "score": r["score"],
+                    "max_pts": r["max_pts"],
+                    "reasoning": r["reasoning"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_excel(graded: dict) -> bytes:
+    """A workbook with a Summary sheet and a Details sheet."""
+    summary = build_summary_df(graded)
+    details = build_details_df(graded)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        details.to_excel(writer, sheet_name="Details", index=False)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Streamlit page
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def get_client() -> OpenAI:
+    return OpenAI()
+
+
+def _load_graded_from_db(rubric_name: str) -> dict:
+    """Return {filename: {"results", "total_score", "max_score"}} from the DB."""
+    graded = {}
+    for row in get_graded_notebooks(rubric_name):
+        graded[row["notebook_filename"]] = {
+            "results": row["results"],
+            "total_score": row["total_score"],
+            "max_score": row["max_score"],
+        }
+    return graded
+
+
+st.title("🎯 Notebook Grader")
+
+if "grader_rubric" not in st.session_state:
+    st.session_state.grader_rubric = None  # {"name","task","csv"}
+if "graded" not in st.session_state:
+    st.session_state.graded = {}  # filename -> {"results","total_score","max_score"}
+
+tab_setup, tab_grade, tab_results = st.tabs(
+    ["1 · Rubric & Task", "2 · Grade notebooks", "3 · Results"]
+)
+
+# ---- Tab 1: Rubric & Task ------------------------------------------------
+with tab_setup:
+    st.markdown(
+        "Define the rubric and task once, then grade as many notebooks against it as "
+        "you like. **Your rubric CSV is passed to the grader exactly as uploaded** — "
+        "every column you wrote is used as-is. You can save it to the database and "
+        "reload it later."
+    )
+
+    existing = list_rubrics()
+    if existing:
+        pick = st.selectbox(
+            "Load a saved rubric", ["— new / upload below —"] + existing, index=0
+        )
+        if pick != "— new / upload below —" and st.button("Load this rubric"):
+            r = get_rubric(pick)
+            if r:
+                st.session_state.grader_rubric = {
+                    "name": r["name"],
+                    "task": r["task"],
+                    "csv": r["rubric_csv"],
+                }
+                st.session_state.graded = _load_graded_from_db(r["name"])
+                st.success(f"Loaded rubric '{r['name']}'.")
+                st.rerun()
+
+    st.divider()
+    rubric_name = st.text_input("Rubric name", value=DEFAULT_RUBRIC_NAME)
+    uploaded_rubric = st.file_uploader("Rubric CSV", type=["csv"])
+    task_text = st.text_area("Task description (graded against)", value=DEFAULT_TASK, height=260)
+
+    if uploaded_rubric is not None and st.button("Save rubric", type="primary"):
+        try:
+            csv_text = uploaded_rubric.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            csv_text = uploaded_rubric.getvalue().decode("latin-1")
+        name = rubric_name.strip() or DEFAULT_RUBRIC_NAME
+        st.session_state.grader_rubric = {"name": name, "task": task_text, "csv": csv_text}
+        ok, err = save_rubric(name, task_text, csv_text)
+        if ok:
+            st.success(f"Saved rubric '{name}' to database.")
+        else:
+            st.warning(f"Rubric ready for this session. Not saved to database: {err}")
+
+    if st.session_state.grader_rubric:
+        st.markdown("#### Active rubric")
+        st.caption(f"**{st.session_state.grader_rubric['name']}**")
+        csv_text = st.session_state.grader_rubric["csv"]
+        try:
+            st.dataframe(
+                pd.read_csv(io.StringIO(csv_text)),
+                use_container_width=True,
+                hide_index=True,
+            )
+        except Exception:
+            st.code(csv_text)  # preview only — the model always receives the raw CSV
+        with st.expander("Raw CSV (exactly what the grader receives)"):
+            st.code(csv_text, language="csv")
+
+# ---- Tab 2: Grade notebooks ----------------------------------------------
+with tab_grade:
+    if not st.session_state.grader_rubric:
+        st.info("Set up a rubric in the **Rubric & Task** tab first.")
+    else:
+        rub = st.session_state.grader_rubric
+        st.markdown(
+            f"Grading against **{rub['name']}**. Upload one or more notebooks — each is "
+            "graded with a separate API call. Re-uploading a filename re-grades it."
+        )
+        uploaded_nbs = st.file_uploader(
+            "Notebooks (.ipynb)", type=["ipynb"], accept_multiple_files=True
+        )
+
+        if uploaded_nbs and st.button(f"Grade {len(uploaded_nbs)} notebook(s)", type="primary"):
+            progress = st.progress(0.0, text="Starting…")
+            n = len(uploaded_nbs)
+            for i, up in enumerate(uploaded_nbs):
+                progress.progress(i / n, text=f"Grading {up.name} ({i + 1}/{n})…")
+                try:
+                    nb_text = notebook_to_text(up.getvalue())
+                except Exception as e:
+                    st.error(f"{up.name}: could not parse notebook — {e}")
+                    continue
+                if not nb_text.strip():
+                    st.error(f"{up.name}: notebook appears to be empty.")
+                    continue
+                results = call_with_errors_surfaced(
+                    grade_notebook, get_client(), rub["task"], rub["csv"], nb_text
+                )
+                if results is None:
+                    continue  # error already surfaced
+                total_score = round(sum(r["score"] for r in results), 2)
+                max_score = round(sum(r["max_pts"] for r in results), 2)
+                st.session_state.graded[up.name] = {
+                    "results": results,
+                    "total_score": total_score,
+                    "max_score": max_score,
+                }
+                ok, err = save_graded_notebook(
+                    {
+                        "rubric_name": rub["name"],
+                        "notebook_filename": up.name,
+                        "notebook_text": nb_text,
+                        "results": results,
+                        "total_score": total_score,
+                        "max_score": max_score,
+                    }
+                )
+                note = "" if ok else f"  ⚠️ not saved to DB ({err})"
+                st.write(f"✅ {up.name}: {total_score:g} / {max_score:g}{note}")
+            progress.progress(1.0, text="Done.")
+
+        if st.session_state.graded:
+            st.caption(f"{len(st.session_state.graded)} notebook(s) graded this session.")
+
+# ---- Tab 3: Results ------------------------------------------------------
+with tab_results:
+    if not st.session_state.grader_rubric:
+        st.info("Set up a rubric and grade some notebooks first.")
+    elif not st.session_state.graded:
+        st.info("No graded notebooks yet — grade some in the **Grade notebooks** tab.")
+    else:
+        graded = st.session_state.graded
+        rubric_name = st.session_state.grader_rubric["name"]
+
+        st.markdown("#### Summary")
+        st.dataframe(build_summary_df(graded), use_container_width=True, hide_index=True)
+
+        st.markdown("#### Details (per rubric item)")
+        st.dataframe(build_details_df(graded), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "⬇️ Download Excel (Summary + Details)",
+            data=build_excel(graded),
+            file_name=f"grades_{rubric_name}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+
+        st.divider()
+        st.markdown("#### Remove saved notebooks")
+        to_remove = st.multiselect(
+            "Select graded notebooks to remove", sorted(graded.keys())
+        )
+        col_rm, col_clear = st.columns(2)
+        if col_rm.button("Remove selected", disabled=not to_remove):
+            errors = []
+            for fname in to_remove:
+                ok, err = delete_graded_notebook(rubric_name, fname)
+                if ok:
+                    st.session_state.graded.pop(fname, None)
+                else:
+                    errors.append(f"{fname}: {err}")
+            if errors:
+                st.warning("Some deletions failed in the database:\n\n" + "\n".join(errors))
+            else:
+                st.success(f"Removed {len(to_remove)} notebook(s).")
+            st.rerun()
+        if col_clear.button(f"Clear ALL for '{rubric_name}'", type="secondary"):
+            ok, err = delete_all_graded_notebooks(rubric_name)
+            st.session_state.graded = {}
+            if ok:
+                st.success("Cleared all graded notebooks for this rubric.")
+            else:
+                st.warning(f"Cleared this session, but the database delete failed: {err}")
+            st.rerun()

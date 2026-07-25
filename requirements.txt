@@ -6,3 +6,4 @@ python-dotenv>=1.0
 plotly>=5.20
 pandas>=2.0
 supabase>=2.0
+openpyxl>=3.1

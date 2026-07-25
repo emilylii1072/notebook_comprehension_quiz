@@ -9,6 +9,7 @@ without a database attached.
 
 import os
 import random
+from datetime import datetime, timezone
 
 import streamlit as st
 from supabase import Client, create_client
@@ -107,3 +108,128 @@ def save_model_followup(
         ).execute()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Notebook grading
+# ---------------------------------------------------------------------------
+
+def save_rubric(name: str, task: str, rubric_csv: str) -> tuple[bool, str | None]:
+    """Upsert a rubric (task + the raw uploaded CSV) by name. Returns (success, error)."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured (SUPABASE_URL/SUPABASE_KEY not set)."
+    try:
+        client.table("grading_rubric").upsert(
+            {
+                "name": name,
+                "task": task,
+                "rubric_csv": rubric_csv,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="name",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_rubric(name: str) -> dict | None:
+    """Fetch a stored rubric by name, or None if unconfigured/missing."""
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("grading_rubric")
+            .select("name,task,rubric_csv")
+            .eq("name", name)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None
+    rows = resp.data or []
+    return rows[0] if rows else None
+
+
+def list_rubrics() -> list[str]:
+    """Names of all stored rubrics (newest first). Empty list if unconfigured."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        resp = (
+            client.table("grading_rubric")
+            .select("name,created_at")
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return []
+    return [r["name"] for r in (resp.data or [])]
+
+
+def save_graded_notebook(payload: dict) -> tuple[bool, str | None]:
+    """Upsert one graded notebook (re-grades on same rubric_name+filename).
+    Returns (success, error). Never raises."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured (SUPABASE_URL/SUPABASE_KEY not set)."
+    try:
+        client.table("graded_notebooks").upsert(
+            payload, on_conflict="rubric_name,notebook_filename"
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_graded_notebook(rubric_name: str, notebook_filename: str) -> tuple[bool, str | None]:
+    """Delete one graded notebook (by rubric + filename). Returns (success, error).
+    Success is also returned when there's no DB configured, so the caller can still
+    drop it from the in-session view."""
+    client = get_supabase_client()
+    if client is None:
+        return True, None
+    try:
+        (
+            client.table("graded_notebooks")
+            .delete()
+            .eq("rubric_name", rubric_name)
+            .eq("notebook_filename", notebook_filename)
+            .execute()
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_all_graded_notebooks(rubric_name: str) -> tuple[bool, str | None]:
+    """Delete every graded notebook for a rubric. Returns (success, error)."""
+    client = get_supabase_client()
+    if client is None:
+        return True, None
+    try:
+        client.table("graded_notebooks").delete().eq("rubric_name", rubric_name).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_graded_notebooks(rubric_name: str) -> list[dict]:
+    """All graded notebooks for a rubric (newest first). Empty if unconfigured."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        resp = (
+            client.table("graded_notebooks")
+            .select("notebook_filename,results,total_score,max_score,created_at")
+            .eq("rubric_name", rubric_name)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return []
+    return resp.data or []

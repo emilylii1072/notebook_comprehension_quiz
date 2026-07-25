@@ -40,7 +40,8 @@ The PM is interested in understanding:
 3. What factors should we take into account when thinking about bringing this \
 model into production?
 A starter sample Person Query dataset (pq_data) is available via the vivainsights \
-Python package. Note: this dataset is known to be incomplete. An attrition label \
+Python package. Install via: pip install vivainsights. \
+Note: this dataset is known to be incomplete. An attrition label \
 column is missing and will need to be engineered or simulated — identifying and \
 addressing this gap is part of the task.
 The notebook should include: the recommended choice of attrition model algorithm \

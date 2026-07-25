@@ -1,15 +1,17 @@
 # Dynamic Evaluation Tools
 
-A multipage Streamlit app with two tools:
+A multipage Streamlit app with three tools:
 
 1. **Notebook Quiz** — generates a comprehension quiz from an uploaded Jupyter notebook.
-2. **Session Timeline** — visualizes a Claude Code session `.jsonl` as an interactive
+2. **Notebook Grader** — grades many uploaded notebooks against a rubric CSV with the
+   OpenAI API and exports scores + reasoning to Excel.
+3. **Session Timeline** — visualizes a Claude Code session `.jsonl` as an interactive
    swimlane timeline.
 
 ```powershell
 pip install -r requirements.txt
 # create a .env file with:
-#   OPENAI_API_KEY = "sk-..."        (only needed for the Notebook Quiz tool)
+#   OPENAI_API_KEY = "sk-..."        (needed for Notebook Quiz and Notebook Grader)
 #   SUPABASE_URL = "https://xxxx.supabase.co"   (optional -- see Database section below)
 #   SUPABASE_KEY = "..."                          (service_role key, not anon)
 python -m streamlit run app.py
@@ -23,20 +25,26 @@ Page code lives in `app_pages/`; `app.py` is just the `st.navigation` router.
 
 ## Database (Supabase)
 
-The Notebook Quiz tool saves every completed quiz (score, per-question breakdown,
-candidate name, notebook filename) to a Postgres table via [Supabase](https://supabase.com).
-**This is optional** — if `SUPABASE_URL`/`SUPABASE_KEY` aren't set, the app still works
-end-to-end; it just shows "⚠️ Not saved to database" instead of "✅ Saved to database"
-and the download-JSON button still works.
+Both the Notebook Quiz and Notebook Grader tools persist to Postgres via
+[Supabase](https://supabase.com). **This is optional** — if `SUPABASE_URL`/`SUPABASE_KEY`
+aren't set, both tools still work end-to-end (the quiz shows "⚠️ Not saved to database"
+but still lets you download JSON; the grader still grades and exports Excel — results
+just don't persist across sessions).
+
+The schema creates four tables:
+- `quiz_results` — one row per completed quiz (score, per-question breakdown).
+- `model_followup_bank` — a growing bank of "benefits and restrictions" questions for
+  the quiz's model follow-up, pre-seeded for Logistic Regression / Random Forest / XGBoost.
+- `grading_rubric` — a saved grading rubric: the task text plus the uploaded rubric CSV
+  stored verbatim, keyed by name.
+- `graded_notebooks` — one row per graded notebook (per-item scores + reasoning),
+  upserted on (rubric, filename) so re-uploading re-grades rather than duplicating.
 
 ### One-time setup
 
 1. Create a free project at [supabase.com](https://supabase.com).
 2. Open **SQL Editor** in your project, paste in the contents of `supabase_schema.sql`
-   from this repo, and run it. This creates the `quiz_results` table.
-   This creates the `quiz_results` table (results) and the `model_followup_bank`
-   table (a growing bank of "benefits and restrictions" questions, pre-seeded for
-   Logistic Regression / Random Forest / XGBoost).
+   from this repo, and run it. This creates the four tables above.
 3. Go to **Project Settings → API** and copy:
    - **Project URL** → `SUPABASE_URL`
    - **`service_role` secret key** (not the `anon` key — the app writes server-side
@@ -45,10 +53,16 @@ and the download-JSON button still works.
    deployment's secrets manager when you deploy (see below). **Never commit them** —
    `.streamlit/` and `.env` are already gitignored.
 
+> **Updating an existing database:** `create table if not exists` never alters a table
+> that already exists. If you set up the DB from an earlier version of this schema and a
+> save fails with `PGRST204 … column not found in the schema cache`, run the matching
+> `alter table` in the SQL Editor (e.g. `alter table grading_rubric add column if not
+> exists rubric_csv text;`) or drop and re-create just that table.
+
 ### Inspecting results
 
-Supabase's own dashboard (**Table Editor → quiz_results**) is a free, ready-made way
-to browse, filter, and export results — no admin page needed.
+Supabase's own dashboard (**Table Editor**) is a free, ready-made way to browse, filter,
+and export any of these tables — no admin page needed.
 
 ---
 
@@ -149,6 +163,49 @@ outline, or production questions).
 - Quiz generation uses `response_format: json_object` plus Pydantic validation rather
   than a provider-specific structured-output helper, so malformed responses raise a
   clear, user-facing error instead of a crash.
+
+---
+
+## Notebook Grader (`app_pages/notebook_grader.py`)
+
+A Streamlit tool for grading **many** submitted notebooks against a rubric with the
+OpenAI API, and exporting scores + reasoning to Excel. Built for grading a batch of
+take-home submissions consistently.
+
+### How it works
+
+The page has three tabs:
+
+1. **Rubric & Task** — upload your rubric as a CSV and (optionally) edit the task
+   description the notebooks were responding to (defaults to the attrition take-home).
+   The rubric CSV is **passed to the model exactly as uploaded** — it is *not* parsed,
+   reshaped, or reduced, so every column of grading guidance you wrote (point values,
+   full/partial/low-credit descriptions, etc.) reaches the grader intact. Rubric + task
+   are saved to Supabase under a name and can be reloaded later.
+2. **Grade notebooks** — upload one or many `.ipynb` files. Each notebook is flattened
+   to a transcript and graded in its **own** OpenAI API call: the model reads the rubric
+   CSV and returns, for every rubric item, a numeric score (0…the item's max, clamped)
+   and 1–3 sentences of reasoning citing specific evidence in the notebook. Each result
+   is saved per-notebook (upsert on rubric + filename, so re-uploading a filename
+   re-grades it). A progress bar tracks the batch; you can upload more notebooks any time.
+3. **Results** — a **Summary** table (one row per notebook: per-section totals, grand
+   total, max, percent) and a **Details** table (every notebook × rubric item, with the
+   reasoning), plus a **Download Excel** button producing a two-sheet workbook
+   (`Summary` + `Details`). This tab also has controls to **remove** individual graded
+   notebooks or clear all of them for a rubric (deletes from Supabase too).
+
+### Notes
+
+- The rubric structure in the output (sections, item names, max points) comes from the
+  model reading your CSV, not from a fixed parse — so the Summary groups by whatever
+  section names the model copies back from the CSV. With a clean, consistent CSV this is
+  stable; the table builders tolerate minor row differences across notebooks.
+- One API call per notebook, all rubric items at once. For a large batch this is the
+  main cost driver — switch `MODEL` in `app_pages/notebook_grader.py` to `gpt-4o-mini`
+  for cheaper/faster grading.
+- Scores are clamped into `[0, max_pts]` server-side, so a model that returns an
+  over-max score can't inflate a total.
+- Excel export uses `openpyxl` (in `requirements.txt`).
 
 ---
 

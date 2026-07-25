@@ -9,6 +9,7 @@ st.set_page_config(page_title="Dynamic Evaluation Tools", page_icon="🧰", layo
 
 page = st.navigation([
     st.Page("app_pages/notebook_quiz.py", title="Notebook Quiz", icon=":material/quiz:"),
+    st.Page("app_pages/notebook_grader.py", title="Notebook Grader", icon=":material/grading:"),
     st.Page("app_pages/session_timeline.py", title="Session Timeline", icon=":material/timeline:"),
 ])
 
