@@ -54,10 +54,13 @@ The schema creates four tables:
    `.streamlit/` and `.env` are already gitignored.
 
 > **Updating an existing database:** `create table if not exists` never alters a table
-> that already exists. If you set up the DB from an earlier version of this schema and a
-> save fails with `PGRST204 … column not found in the schema cache`, run the matching
-> `alter table` in the SQL Editor (e.g. `alter table grading_rubric add column if not
-> exists rubric_csv text;`) or drop and re-create just that table.
+> that already exists, so a database built from an earlier version of this schema keeps
+> its old columns — and a save then fails with `PGRST204 … column not found in the
+> schema cache`. The **Migrations** section at the bottom of `supabase_schema.sql`
+> handles this: it is idempotent, so just re-run the whole file in the SQL Editor. On a
+> fresh database it does nothing; on an older one it adds the missing columns and drops
+> the `not null` constraints on retired ones. After migrating `grading_rubric`, re-save
+> your rubrics from the Rubric & Task tab so `rubric_csv` is populated.
 
 ### Inspecting results
 

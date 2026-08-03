@@ -111,3 +111,47 @@ create index if not exists graded_notebooks_rubric_idx
   on graded_notebooks (rubric_name, created_at desc);
 
 alter table graded_notebooks enable row level security;
+
+
+-- ---------------------------------------------------------------------------
+-- Migrations for databases created from an earlier version of this file
+-- ---------------------------------------------------------------------------
+-- `create table if not exists` skips a table that already exists, so the blocks
+-- above never alter one. Everything below is idempotent and safe to re-run: on a
+-- fresh database it is a no-op, on an older one it brings the tables up to date.
+
+-- grading_rubric once stored a parsed rubric (`items` jsonb + `total_points`).
+-- The grader now hands the model the uploaded CSV verbatim, so the rubric lives
+-- in `rubric_csv` and the two old columns are unused. Without this migration a
+-- save fails with: PGRST204 "Could not find the 'rubric_csv' column".
+alter table grading_rubric add column if not exists rubric_csv text;
+
+-- Added nullable on purpose: a `not null` column cannot be added to a table that
+-- already has rows. Rubrics saved before this migration have it empty -- re-save
+-- them from the Rubric & Task tab (upsert by name) to fill it in.
+
+-- The legacy columns must also stop being required, or every insert fails on a
+-- not-null violation: the app no longer writes either one. DO blocks because
+-- `alter column` has no `if exists` and errors on a fresh database.
+do $$
+begin
+  if exists (select 1 from information_schema.columns
+             where table_schema = 'public' and table_name = 'grading_rubric'
+                   and column_name = 'items') then
+    alter table grading_rubric alter column items drop not null;
+  end if;
+  if exists (select 1 from information_schema.columns
+             where table_schema = 'public' and table_name = 'grading_rubric'
+                   and column_name = 'total_points') then
+    alter table grading_rubric alter column total_points drop not null;
+  end if;
+end $$;
+
+-- Optional cleanup, commented out because it permanently deletes the old rubric
+-- data. Run it only after re-saving your rubrics; nothing in the app reads these.
+-- alter table grading_rubric drop column if exists items,
+--                            drop column if exists total_points;
+
+-- PostgREST caches the schema and answers from that cache; this makes the new
+-- column visible immediately instead of waiting for its own reload.
+notify pgrst, 'reload schema';
