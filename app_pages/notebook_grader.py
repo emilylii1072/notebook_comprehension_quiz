@@ -46,33 +46,71 @@ DEFAULT_RUBRIC_NAME = "attrition_v1"
 # UI, stored to Supabase alongside the rubric so every notebook is graded against the
 # exact task text that was in effect.
 DEFAULT_TASK = """\
-You have been tasked with a PM request to design and create an MVP employee attrition \
-model using Viva Insights data. The goal is to build a prototype that will inform \
-whether this feature is worth investing engineering resources.
-The PM is interested in understanding:
-1. If we were to create an employee attrition model, what would this look like?
-2. What would be the inputs and outputs of the model?
-3. What factors should we take into account when thinking about bringing this model \
-into production?
-A starter sample Person Query dataset (pq_data) is available via the vivainsights \
-Python package. Install via: pip install vivainsights.
-Note: this dataset is known to be incomplete. An attrition label column is missing and \
-will need to be engineered or simulated — identifying and addressing this gap is part \
-of the task.
-Your notebook should include:
-- Your recommended choice of attrition model algorithm and rationale
-- Code demonstrating how the model would run end-to-end
-- Example outputs from the model (predictions, feature importance, evaluation metrics)
-- A brief discussion of production considerations
+Participants had ~30 minutes and were told this is an open-ended, intentionally
+underspecified research task (identifying gaps and making reasonable assumptions
+is part of the task). The brief:
+
+  A PM asks for an MVP employee attrition model using Viva Insights data, to
+  inform whether the feature is worth engineering investment. PM questions:
+  (1) If we created an employee attrition model, what would it look like?
+  (2) What would be the inputs and outputs of the model?
+  (3) What factors matter when bringing this model into production?
+
+  Data: the sample Person Query dataset (pq_data) from the `vivainsights`
+  Python package. The brief explicitly notes the dataset is incomplete: an
+  attrition label column is missing and must be engineered or simulated.
+
+  Required output: a Jupyter notebook with (a) recommended model algorithm and
+  rationale, (b) code demonstrating the model end-to-end, (c) example outputs
+  (predictions, feature importance, evaluation metrics), (d) a brief discussion
+  of production considerations. Participants worked with an AI coding agent.
 """
 
-SYSTEM_PROMPT = (
-    "You are a meticulous, fair grader of data-science take-home notebooks."
-    "You never inflate scores, you award "
-    "partial credit where the work is partially done, and every score is justified by "
-    "concrete, specific reference to the notebook's content (cells, code, outputs, or "
-    "markdown)."
-)
+
+def build_system_prompt(task: str, rubric_csv: str) -> str:
+    """The grader's system message: study context, the rubric CSV verbatim, and the
+    grading rules. The CSV is embedded as uploaded — never reparsed or transformed."""
+    return f"""You are an expert data-science instructor grading Jupyter notebooks \
+from a research study, strictly and consistently against a fixed rubric.
+
+
+## Study context
+{task}
+
+
+## Rubric (the exact CSV the grader uploaded)
+```csv
+{rubric_csv}
+```
+
+
+## Grading rules
+- Score every scoreable rubric item (row) from 0 to that item's maximum points,
+  reading every column of the CSV — point values and any full/partial/low-credit
+  guidance — as written.
+- Judge only what is present in the notebook transcript. Do not give credit for
+  things the participant might have said aloud or done elsewhere.
+- Use each item's scoring guidance on a consistent scale: 0 points when the
+  criterion is missing, unattempted, or completely incorrect; roughly half of the
+  maximum when the partial-credit guidance describes the notebook; the maximum
+  only when the full-credit guidance is clearly met. Interpolate between anchors
+  for in-between cases.
+- Where an item's description says some evidence is scored under a different
+  item, do NOT double-credit that evidence here.
+- Cell outputs are truncated and figures are replaced by placeholders like
+  "[image/png output: ...]"; treat such placeholders as evidence that the code
+  ran and produced a figure, and judge the figure's purpose from the code.
+- An empty or near-empty notebook should receive 0s with a brief explanation.
+- Be consistent: the same evidence must always earn the same score.
+- Reasoning: 1-3 concrete sentences referencing cell numbers.
+
+## Output format
+Respond with ONLY a JSON object (no markdown code fences, no commentary), exactly
+this shape, one entry per scoreable rubric item, in the order they appear in the
+CSV. Copy each item's section name and maximum points from the CSV verbatim:
+{{"items": [{{"section": "<section from the CSV>", "criterion": "<short name of the \
+rubric item from the CSV>", "max_pts": <the item's max points from the CSV>, "score": \
+<number between 0 and max_pts>, "reasoning": "<1-3 sentences>"}}]}}"""
 
 
 class GradedItem(BaseModel):
@@ -128,39 +166,16 @@ def grade_notebook(
     """Score one notebook against the rubric CSV. The CSV text is given to the model
     exactly as uploaded; the model reads it and returns one score + reasoning per
     rubric item. Returns [{"section","criterion","max_pts","score","reasoning"}]."""
-    instructions = f"""\
-Below is a grading rubric, provided as the exact CSV file the grader uploaded. Read \
-the rubric yourself — use every column (point values, and any full/partial/low-credit \
-guidance) as written. Grade the notebook against it.
-
-For EACH scoreable rubric item (row) in the CSV, assign a numeric score between 0 and \
-that item's maximum points (fractional scores allowed) and write 1-3 sentences of \
-reasoning citing specific evidence from the notebook (or its absence). Be strict and \
-evidence-based: award the max only when the item is fully satisfied, partial credit \
-when partially satisfied, and 0 when absent. Copy the item's section name and maximum \
-points from the CSV verbatim.
-
-THE TASK THE NOTEBOOK WAS RESPONDING TO:
-{task}
-
-RUBRIC CSV (verbatim):
-```csv
-{rubric_csv}
-```
-
-Respond with ONLY a single JSON object (no markdown code fences, no commentary) of \
-the exact shape:
-{{"items": [{{"section": "<section from the CSV>", "criterion": "<short name of the \
-rubric item from the CSV>", "max_pts": <the item's max points from the CSV>, "score": \
-<number between 0 and max_pts>, "reasoning": "<1-3 sentences>"}}]}}
-Return one entry per scoreable rubric item, in the order they appear in the CSV."""
-
-    user_content = f"<notebook>\n{notebook_text}\n</notebook>\n\n{instructions}"
+    user_content = (
+        "Grade the following notebook.\n\n"
+        f"===== BEGIN NOTEBOOK TRANSCRIPT =====\n{notebook_text}\n"
+        "===== END NOTEBOOK TRANSCRIPT ====="
+    )
     response = client.chat.completions.create(
         model=MODEL,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(task, rubric_csv)},
             {"role": "user", "content": user_content},
         ],
     )
