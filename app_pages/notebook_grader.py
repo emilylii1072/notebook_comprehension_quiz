@@ -34,6 +34,8 @@ from db import (
     list_rubrics,
     save_graded_notebook,
     save_rubric,
+    supabase_status,
+    test_connection,
 )
 
 load_dotenv()
@@ -393,6 +395,38 @@ with tab_setup:
             st.code(csv_text)  # preview only — the model always receives the raw CSV
         with st.expander("Raw CSV (exactly what the grader receives)"):
             st.code(csv_text, language="csv")
+
+    st.divider()
+    with st.expander("Database status (troubleshooting)"):
+        status = supabase_status()
+        if status["client_created"]:
+            st.success("Supabase credentials found — results will persist.")
+        else:
+            st.warning(
+                "No Supabase client. Grading and Excel export still work, but nothing "
+                "persists. Add `SUPABASE_URL` / `SUPABASE_KEY` as **top-level** keys in "
+                "Streamlit Cloud → Settings → Secrets (not nested under a `[section]` "
+                "header), then **Reboot app**."
+            )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"secret": name, **{k: str(v) for k, v in status[name].items()}}
+                    for name in ("SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY")
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Top-level keys visible to the app: "
+            + (", ".join(f"`{k}`" for k in status["top_level_secrets"]) or "_none_")
+            + (f"  \nst.secrets error: {status['secrets_error']}"
+               if status["secrets_error"] else "")
+        )
+        if st.button("Test database connection"):
+            ok, msg = test_connection()
+            (st.success if ok else st.error)(msg)
 
 # ---- Tab 2: Grade notebooks ----------------------------------------------
 with tab_grade:

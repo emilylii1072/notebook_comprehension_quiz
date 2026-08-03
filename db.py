@@ -33,6 +33,78 @@ def get_supabase_client() -> Client | None:
     return create_client(url, key)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics -- "why isn't it saving?" without ever exposing a credential
+# ---------------------------------------------------------------------------
+
+def _key_role(key: str) -> str:
+    """Best-effort role of a Supabase key. The app needs the service_role key: it
+    writes server-side and must bypass row-level security."""
+    if key.startswith("sb_secret_"):
+        return "service_role (new-style sb_secret_ key)"
+    if key.startswith("sb_publishable_"):
+        return "PUBLISHABLE -- wrong key, writes will be blocked by RLS"
+    parts = key.split(".")
+    if len(parts) == 3:  # legacy JWT -- read the unverified payload for its role
+        import base64
+        import json
+        try:
+            pad = parts[1] + "=" * (-len(parts[1]) % 4)
+            role = json.loads(base64.urlsafe_b64decode(pad)).get("role", "")
+        except Exception:
+            return "unknown (could not decode)"
+        if role == "service_role":
+            return "service_role"
+        if role:
+            return f"{role.upper()} -- wrong key, writes will be blocked by RLS"
+    return "unknown format"
+
+
+def supabase_status() -> dict:
+    """What the running process can actually see, for troubleshooting a deployment.
+
+    Returns only presence/shape facts -- never a secret value. `top_level_secrets`
+    is the key names st.secrets exposes: if the credentials were pasted under a
+    TOML section header they show up as the section name instead of SUPABASE_URL,
+    which is the usual reason a "configured" app still reports it isn't."""
+    info: dict = {"secrets_error": None, "top_level_secrets": []}
+    try:
+        info["top_level_secrets"] = sorted(st.secrets.keys())
+    except Exception as e:
+        info["secrets_error"] = str(e)  # no secrets.toml at all (normal locally)
+
+    for name in ("SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY"):
+        in_secrets = name in info["top_level_secrets"]
+        value = _get_secret(name)
+        info[name] = {
+            "found": bool(value),
+            "source": "st.secrets" if in_secrets else ("env/.env" if value else "-"),
+            "length": len(value) if value else 0,
+            "has_whitespace": bool(value) and value != value.strip(),
+        }
+    url = _get_secret("SUPABASE_URL")
+    if url:
+        info["SUPABASE_URL"]["looks_like_url"] = url.strip().startswith("https://")
+    key = _get_secret("SUPABASE_KEY")
+    if key:
+        info["SUPABASE_KEY"]["role"] = _key_role(key.strip())
+
+    info["client_created"] = get_supabase_client() is not None
+    return info
+
+
+def test_connection() -> tuple[bool, str]:
+    """Round-trip a real read against the database. Returns (ok, message)."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "No client -- SUPABASE_URL/SUPABASE_KEY not visible to the app."
+    try:
+        resp = client.table("grading_rubric").select("name", count="exact").limit(1).execute()
+        return True, f"Connected. grading_rubric has {resp.count} row(s)."
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def save_quiz_result(payload: dict) -> tuple[bool, str | None]:
     """Insert one row into the `quiz_results` table.
 
