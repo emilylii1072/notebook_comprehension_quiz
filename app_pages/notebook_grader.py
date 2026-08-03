@@ -40,7 +40,7 @@ from db import (
 
 load_dotenv()
 
-MODEL = "gpt-4o"  # swap to "gpt-4o-mini" for cheaper/faster test iteration
+MODEL = "gpt-5.5"  # swap to "gpt-5.4-mini" for cheaper/faster test iteration
 MAX_OUTPUT_CHARS_PER_CELL = 1500
 DEFAULT_RUBRIC_NAME = "attrition_v1"
 
