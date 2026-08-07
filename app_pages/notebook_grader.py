@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
+from build_report import records_from_graded, render_report
 from db import (
     delete_all_graded_notebooks,
     delete_graded_notebook,
@@ -333,8 +334,8 @@ if "grader_rubric" not in st.session_state:
 if "graded" not in st.session_state:
     st.session_state.graded = {}  # filename -> {"results","total_score","max_score"}
 
-tab_setup, tab_grade, tab_results = st.tabs(
-    ["1 · Rubric & Task", "2 · Grade notebooks", "3 · Results"]
+tab_setup, tab_grade, tab_results, tab_report = st.tabs(
+    ["1 · Rubric & Task", "2 · Grade notebooks", "3 · Results", "4 · Report"]
 )
 
 # ---- Tab 1: Rubric & Task ------------------------------------------------
@@ -535,3 +536,31 @@ with tab_results:
             else:
                 st.warning(f"Cleared this session, but the database delete failed: {err}")
             st.rerun()
+
+# ---- Tab 4: Report -------------------------------------------------------
+with tab_report:
+    if not st.session_state.grader_rubric:
+        st.info("Set up a rubric and grade some notebooks first.")
+    elif not st.session_state.graded:
+        st.info("No graded notebooks yet — grade some in the **Grade notebooks** tab.")
+    else:
+        rubric_name = st.session_state.grader_rubric["name"]
+        st.markdown(
+            "Visual review of every notebook graded against this rubric: score "
+            "distribution, per-section spread, a notebook × criterion heatmap, the "
+            "criteria the cohort did worst on, and a clustering of scoring profiles. "
+            "Hover any mark for detail; click one to jump to that notebook."
+        )
+        records = records_from_graded(st.session_state.graded)
+        report_html = render_report(records, rubric_name)
+        st.download_button(
+            "⬇️ Download report (single HTML file)",
+            data=report_html,
+            file_name=f"report_{rubric_name}.html",
+            mime="text/html",
+        )
+        # An iframe, not st.html: the report ships its own CSS reset and tooltip
+        # script, which must not leak into (or inherit from) the app's styles.
+        # height="content" lets the page scroll normally instead of nesting a
+        # scrollbar inside a fixed frame.
+        st.iframe(report_html, height="content")

@@ -289,15 +289,22 @@ def delete_all_graded_notebooks(rubric_name: str) -> tuple[bool, str | None]:
         return False, str(e)
 
 
-def get_graded_notebooks(rubric_name: str) -> list[dict]:
-    """All graded notebooks for a rubric (newest first). Empty if unconfigured."""
+def get_graded_notebooks(rubric_name: str, include_text: bool = False) -> list[dict]:
+    """All graded notebooks for a rubric (newest first). Empty if unconfigured.
+
+    `include_text` also fetches the stored notebook transcript -- off by default
+    because the app's tables never show it and it dominates the payload size;
+    build_report.py turns it on to embed the transcript in its review pages."""
     client = get_supabase_client()
     if client is None:
         return []
+    columns = "notebook_filename,results,total_score,max_score,created_at"
+    if include_text:
+        columns += ",notebook_text"
     try:
         resp = (
             client.table("graded_notebooks")
-            .select("notebook_filename,results,total_score,max_score,created_at")
+            .select(columns)
             .eq("rubric_name", rubric_name)
             .order("created_at", desc=True)
             .execute()
