@@ -54,22 +54,19 @@ discussion of production considerations."
 # the model_followup question bank (below) has a small, known key space.
 FIXED_MODEL_OPTIONS = ["Random Forest", "XGBoost", "Logistic Regression", "Support Vector Machine"]
 
-# Fixed distractors for the "io" question -- the LLM only has to generate the one
-# correct option, in the same "Input: ...; Output: ..." format.
-FIXED_IO_DISTRACTORS = [
-    "Input: employee workplace and activity features; Output: the feature importance values used to train the model",
-    "Input: each employee's known future attrition status; Output: the workplace features most associated with leaving",
-    "Input: employee identifiers and activity features; Output: the predicted date on which each employee will leave",
-]
-
-# The 4 questions generated together in one batch call (generate_quiz). label_exists
-# is a separate, fixed (non-LLM) question inserted right after model_choice -- see
-# label_exists_question(). model_followup and label_followup are dynamic follow-ups,
-# materialized live during the quiz; see FOLLOWUP_AFTER / FOLLOWUP_SUBJECT_FOR_TRIGGER.
-# This is the complete question set -- there are no other slots.
+# The 8 questions generated together in one batch call (generate_quiz). num_employees,
+# row_granularity, label_exists, and io_overlap_ok are separate, fixed (non-LLM)
+# questions inserted at specific points in the sequence -- see build_items() below.
+# model_followup and label_followup are dynamic follow-ups, materialized live during
+# the quiz; see FOLLOWUP_AFTER / FOLLOWUP_SUBJECT_FOR_TRIGGER. This is the complete
+# LLM-generated question set -- there are no other LLM slots.
 SLOT_ORDER = [
+    "aggregation",
+    "train_test_split",
     "model_choice",
-    "io",
+    "io_overlap",
+    "inputs",
+    "outputs",
     "metric_choice",
     "metric_interpretation",
 ]
@@ -86,8 +83,23 @@ FOLLOWUP_SUBJECT_FOR_TRIGGER = {
 }
 
 SLOT_INSTRUCTIONS = {
+    "aggregation": """\
+1. aggregation — Ask: "How did the notebook aggregate the dataset's rows (which \
+start as one row per employee per week) before using them to train the model?" All \
+4 options must use plausible, technical data-preparation terminology (e.g., \
+averaging metrics across weeks, taking only the most recent week, summing across \
+weeks, computing rolling/trailing statistics) and sound reasonable; exactly one \
+must describe what the notebook actually did, the other three must be \
+plausible-but-wrong aggregation approaches it did NOT use.""",
+    "train_test_split": """\
+2. train_test_split — Ask: "How did the notebook split the data into training and \
+test sets?" All 4 options must use plausible, technical terminology (e.g., a random \
+split with a given ratio, a stratified split, a time-based/chronological split, \
+cross-validation with no separate held-out test set) and sound reasonable; exactly \
+one must describe what the notebook actually did, the other three must be \
+plausible-but-wrong splitting approaches it did NOT use.""",
     "model_choice": """\
-1. model_choice — Determine which ONE of these four algorithms the notebook \
+3. model_choice — Determine which ONE of these four algorithms the notebook \
 actually used/chose as its (primary or recommended) attrition model: "Random \
 Forest", "XGBoost", "Logistic Regression", "Support Vector Machine". Set "options" \
 to these four exact strings (verbatim, any order) and "correct_index" to whichever \
@@ -98,27 +110,38 @@ XGBoost; other tree ensembles → Random Forest; other linear/regularized linear
 classifiers → Logistic Regression; other margin/kernel-based classifiers → Support \
 Vector Machine) and name the notebook's actual model explicitly in the \
 explanation.""",
-    "io": """\
-2. io — Determine the final model's actual inputs and outputs from the notebook, \
-and phrase the correct option in EXACTLY this format: "Input: <...>; Output: \
-<...>" (one short fragment per side). Set "options" to a list of exactly 4 \
-strings: the 3 fixed distractors below, copied VERBATIM character-for-character, \
-plus your one generated correct option — in any order — and set "correct_index" to \
-point at your generated option.
-
-Fixed distractors (copy verbatim, do not alter):
-- "Input: employee workplace and activity features; Output: the feature importance values used to train the model"
-- "Input: each employee's known future attrition status; Output: the workplace features most associated with leaving"
-- "Input: employee identifiers and activity features; Output: the predicted date on which each employee will leave\"""",
+    "io_overlap": """\
+4. io_overlap — Ask exactly: "Are there any variables that were in both the input \
+and output of your model?" Determine, from the notebook, whether ANY \
+variable/feature used as a model INPUT also appears as (or leaks into) the \
+model's OUTPUT/target. Set "options" to exactly ["Yes", "No"] (this slot uses only \
+2 options, not 4) and "correct_index" to whichever is actually true of the \
+notebook's final model — the option "Yes" if there is overlap/leakage, "No" if the \
+inputs and output are cleanly separated. Answer based on what the notebook's final \
+model actually does, not a hypothetical.""",
+    "inputs": """\
+5. inputs — Ask: "What are the inputs (features) of the final model?" Phrase the \
+correct option as a short, specific description of the actual input features the \
+notebook's final model uses. The three distractors must be plausible-but-wrong \
+descriptions of the inputs — e.g., including the label/target as an input, using \
+identifiers instead of behavioral features, or naming a feature set the notebook \
+did not actually use.""",
+    "outputs": """\
+6. outputs — Ask: "What is the output (target) of the final model?" Phrase the \
+correct option as a short, specific description of the actual output the \
+notebook's final model produces (e.g., a predicted probability or class of \
+attrition). The three distractors must be plausible-but-wrong descriptions of the \
+output — e.g., a predicted leave-date, feature importance values, or a workplace \
+metric instead of an attrition prediction.""",
     "metric_choice": """\
-3. metric_choice — Ask: "How did the notebook evaluate the attrition models' \
+7. metric_choice — Ask: "How did the notebook evaluate the attrition models' \
 performance?" All 4 options must use plausible, technical evaluation terminology \
 (e.g., specific metric names, cross-validation, a held-out test set, a confusion \
 matrix) and sound reasonable; exactly one must describe what the notebook actually \
 did to evaluate performance, the other three must be plausible-but-wrong evaluation \
 approaches it did NOT use.""",
     "metric_interpretation": """\
-4. metric_interpretation — Identify the notebook's actual evaluation metric AND its \
+8. metric_interpretation — Identify the notebook's actual evaluation metric AND its \
 actual reported value or range (e.g., "cross-validated AUC-ROC scores around \
 0.53-0.58"). Quote that specific metric name and value/range in the question text, \
 then ask what that result means. If the metric is AUC-ROC (or ROC-AUC): ground the \
@@ -146,7 +169,8 @@ number is low so it's bad" claim that misses the actual nuance).""",
 
 SHARED_REQUIREMENTS = """\
 Shared requirements for every question:
-- Exactly 4 options per question, exactly one correct (correct_index is 0-based).
+- Exactly 4 options per question (except "io_overlap", which uses exactly 2: \
+"Yes"/"No"), exactly one correct (correct_index is 0-based).
 - Ground every question in the specific content of THIS notebook: reference its \
 actual modeling choices, engineered attrition label, feature names, metric values, \
 and stated production considerations.
@@ -275,18 +299,87 @@ def label_exists_question() -> QuizQuestion:
     )
 
 
+def num_employees_question() -> QuizQuestion:
+    """A fixed, non-LLM question. pq_data always has the same 300 unique PersonId
+    values for every candidate, so the correct answer never depends on the
+    notebook's content -- no API call needed."""
+    q = QuizQuestion(
+        slot="num_employees",
+        topic="dataset size",
+        question="How many employees are in the pq_data dataset used for this task?",
+        options=["100", "300", "1000", "3000"],
+        correct_index=1,
+        explanation=(
+            "pq_data contains 300 unique employees (distinct PersonId values), each "
+            "with one row per week over a 35-week period."
+        ),
+    )
+    _reshuffle(q)
+    return q
+
+
+def row_granularity_question() -> QuizQuestion:
+    """A fixed, non-LLM question about pq_data's row grain, which is identical for
+    every candidate -- no API call needed."""
+    q = QuizQuestion(
+        slot="row_granularity",
+        topic="row granularity",
+        question=(
+            "What does a single row represent in the original pq_data dataset "
+            "(before any aggregation)?"
+        ),
+        options=[
+            "One employee's metrics",
+            "One employee's metrics per week",
+            "One employee's metrics per month",
+            "One metric per employee",
+        ],
+        correct_index=1,
+        explanation=(
+            "pq_data is a weekly Person Query: each row is one employee's "
+            "behavioral metrics for a single week (the MetricDate column), with 35 "
+            "weekly rows per employee."
+        ),
+    )
+    _reshuffle(q)
+    return q
+
+
+def io_overlap_ok_question() -> QuizQuestion:
+    """A fixed, non-LLM question testing general ML knowledge (data leakage) rather
+    than anything specific to this notebook -- no API call needed."""
+    return QuizQuestion(
+        slot="io_overlap_ok",
+        topic="data leakage",
+        question=(
+            "Is it okay for a variable to be used as both an input (feature) and "
+            "the output (target/label) of a predictive model?"
+        ),
+        options=["Yes", "No"],
+        correct_index=1,
+        explanation=(
+            "No — if a variable used to construct the label also appears among the "
+            "input features, the model can 'leak' information about the label "
+            "through that feature, producing misleadingly good performance that "
+            "won't hold up on genuinely unseen data."
+        ),
+    )
+
+
 BATCH_JSON_SCHEMA_NOTE = """\
 Respond with ONLY a single JSON object (no markdown code fences, no commentary) \
 matching this exact shape:
 {"questions": [
-  {"slot": "<one of: model_choice, io, metric_choice, metric_interpretation>",
+  {"slot": "<one of: aggregation, train_test_split, model_choice, io_overlap, \
+inputs, outputs, metric_choice, metric_interpretation>",
    "topic": "<2-4 word tag>", "question": "<question text, may include \\n and \
 fenced ```code``` blocks>",
-   "options": ["<A>", "<B>", "<C>", "<D>"], "correct_index": <0-3 integer>,
+   "options": ["<A>", "<B>", ...], "correct_index": <integer>,
    "explanation": "<1-3 sentence explanation>"}
 ]}
-Return EXACTLY 4 questions, one per slot listed above, in that exact order \
-(model_choice first, metric_interpretation last).
+Return EXACTLY 8 questions, one per slot listed above, in that exact order \
+(aggregation first, metric_interpretation last). Every slot uses exactly 4 options \
+EXCEPT "io_overlap", which uses exactly 2 options: ["Yes", "No"] (either order).
 """
 
 
@@ -295,7 +388,7 @@ Return EXACTLY 4 questions, one per slot listed above, in that exact order \
 # ---------------------------------------------------------------------------
 
 def generate_quiz(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
-    """Generate the 4 static (non-follow-up) questions in one call."""
+    """Generate the 8 LLM-authored, static (non-follow-up) questions in one call."""
     instructions = "\n\n".join(SLOT_INSTRUCTIONS[s] for s in SLOT_ORDER)
     instructions = f"{instructions}\n\n{SHARED_REQUIREMENTS}\n{BATCH_JSON_SCHEMA_NOTE}"
     user_content = f"{notebook_prompt_prefix(notebook_text)}\n\n{instructions}"
@@ -322,7 +415,8 @@ def generate_quiz(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
     deduped = []
     for q in quiz.questions:
         if q.slot in order_index and q.slot not in seen:
-            if len(q.options) != 4 or not (0 <= q.correct_index < 4):
+            expected_len = 2 if q.slot == "io_overlap" else 4
+            if len(q.options) != expected_len or not (0 <= q.correct_index < expected_len):
                 raise RuntimeError(
                     f"The generated '{q.slot}' question was malformed — try again."
                 )
@@ -331,13 +425,11 @@ def generate_quiz(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
                     "The generated 'model_choice' options didn't match the required "
                     "fixed model list — try again."
                 )
-            if q.slot == "io":
-                fixed_present = [o for o in q.options if o in FIXED_IO_DISTRACTORS]
-                if len(fixed_present) != 3:
-                    raise RuntimeError(
-                        "The generated 'io' options didn't include the three "
-                        "required fixed distractors — try again."
-                    )
+            if q.slot == "io_overlap" and set(q.options) != {"Yes", "No"}:
+                raise RuntimeError(
+                    "The generated 'io_overlap' options must be exactly Yes/No — "
+                    "try again."
+                )
             seen.add(q.slot)
             deduped.append(q)
     deduped.sort(key=lambda q: order_index[q.slot])
@@ -349,20 +441,34 @@ def generate_quiz(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
             "try again."
         )
 
-    # Python-side reshuffle guarantees true randomization for the two fixed-option
+    # Python-side reshuffle guarantees true randomization for the fixed-option
     # slots, regardless of what order the LLM happened to emit them in.
     for q in deduped:
-        if q.slot in ("model_choice", "io"):
+        if q.slot in ("model_choice", "io_overlap"):
             _reshuffle(q)
 
     return deduped
 
 
 def assemble_static_questions(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
-    """Generate the 4 LLM-authored questions, then insert the fixed label_exists
-    question right after model_choice."""
+    """Generate the 8 LLM-authored questions, then interleave the 4 fixed (non-LLM)
+    questions at their fixed positions in the sequence."""
     generated = generate_quiz(client, notebook_text)
-    return [generated[0], label_exists_question()] + generated[1:]
+    by_slot = {q.slot: q for q in generated}
+    return [
+        num_employees_question(),
+        row_granularity_question(),
+        by_slot["aggregation"],
+        label_exists_question(),
+        by_slot["train_test_split"],
+        by_slot["model_choice"],
+        by_slot["io_overlap"],
+        io_overlap_ok_question(),
+        by_slot["inputs"],
+        by_slot["outputs"],
+        by_slot["metric_choice"],
+        by_slot["metric_interpretation"],
+    ]
 
 
 def _call_single_question(client: OpenAI, notebook_text: str, instructions: str) -> QuizQuestion:

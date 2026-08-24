@@ -82,13 +82,16 @@ the candidate takes.
 
 1. **Upload** — the candidate uploads their `.ipynb`. The app flattens markdown, code,
    and (truncated) cell outputs into a transcript.
-2. **Generate** — the model generates 4 static questions in one batch call (`model_choice`,
-   `io`, `metric_choice`, `metric_interpretation`), following a fixed per-slot template
-   (see below) so difficulty and coverage are consistent across notebooks and runs.
-   JSON-mode output plus Pydantic validation guarantee well-formed questions. A 5th
-   question, `label_exists` (Yes/No, not LLM-generated), is inserted right after
-   `model_choice`. The correct answer and explanation are generated/fixed up front along
-   with each question, but never shown to the candidate until the final breakdown.
+2. **Generate** — the model generates 8 static questions in one batch call
+   (`aggregation`, `train_test_split`, `model_choice`, `io_overlap`, `inputs`,
+   `outputs`, `metric_choice`, `metric_interpretation`), following a fixed per-slot
+   template (see below) so difficulty and coverage are consistent across notebooks and
+   runs. JSON-mode output plus Pydantic validation guarantee well-formed questions. 4
+   more fixed, not-LLM-generated questions (`num_employees`, `row_granularity`,
+   `label_exists`, `io_overlap_ok`) are interleaved at fixed points in the sequence —
+   their correct answers don't depend on the notebook's content. The correct answer and
+   explanation are generated/fixed up front along with each question, but never shown
+   to the candidate until the final breakdown.
 3. **Quiz** — questions are presented one at a time; a stopwatch (not a countdown) shows
    elapsed time, with no limit and no auto-submit. Two questions are personalized live,
    based on the candidate's own preceding answer:
@@ -112,37 +115,56 @@ the candidate takes.
 
 ### Question template (fixed slots, in order)
 
-1. **Model choice** — fixed 4-option list (Random Forest / XGBoost / Logistic Regression
+1. **Num employees** *(fixed, not LLM-generated)* — "How many employees are in the
+   pq_data dataset?" 100 / 300 / 1000 / 3000; the correct answer is always 300 (pq_data
+   always has 300 unique `PersonId` values).
+2. **Row granularity** *(fixed, not LLM-generated)* — what a single row in the original
+   pq_data represents; the correct answer is always "one employee's metrics per week"
+   (pq_data is a weekly Person Query — 35 weekly rows per employee).
+3. **Aggregation** — how the notebook aggregated the weekly rows before training (one
+   real approach among plausible-but-unused aggregation methods).
+4. **Model choice** — fixed 4-option list (Random Forest / XGBoost / Logistic Regression
    / Support Vector Machine); the correct option is whichever the notebook actually used
    (falls back to the closest match if the notebook used a model outside this list).
-2. **Model follow-up** *(personalized, DB-backed)* — benefits/restrictions of the
+5. **Model follow-up** *(personalized, DB-backed)* — benefits/restrictions of the
    candidate's chosen model (see above).
-3. **Label exists** *(fixed, not LLM-generated)* — "Is there an employee attrition label
+6. **Label exists** *(fixed, not LLM-generated)* — "Is there an employee attrition label
    in the dataset?" Yes/No; the correct answer is always "No" (the label is simulated).
-4. **Label follow-up** *(personalized, conditional)* — only shown if Q3 was answered
+7. **Label follow-up** *(personalized, conditional)* — only shown if Q6 was answered
    "No"; asks how the notebook actually addressed the missing/simulated label.
-5. **Inputs/outputs** — 3 fixed, hand-written wrong-shaped distractors (wrong output
-   type: feature importances / attrition-associated features / a predicted leave-date)
-   plus one LLM-generated correct option in `Input: ...; Output: ...` format, grounded
-   in what the notebook's final model actually takes in and produces.
-6. **Evaluation metric** — how the notebook evaluated model performance (one real option
-   among plausible unused metric names).
-7. **Metric interpretation** — a worked example using the notebook's own reported metric
-   value (e.g. "the notebook reports a cross-validated AUC-ROC around 0.53-0.58 — what
-   does that mean?"), testing whether the candidate can interpret the number rather than
-   just naming the metric.
+8. **Train/test split** — how the notebook split the data for training vs. evaluation
+   (one real approach among plausible-but-unused splitting methods).
+9. **IO overlap** — Yes/No: "Are there any variables that were in both the input and
+   output of your model?" The correct answer is determined by the LLM reading the
+   notebook, not fixed — it's correct if consistent with what the notebook's final model
+   actually does.
+10. **IO overlap OK** *(fixed, not LLM-generated)* — general-knowledge Yes/No: "Is it
+    okay for a variable to be both an input and the output?" The correct answer is
+    always "No" (data leakage).
+11. **Inputs** — what the final model's actual input features are (one real option among
+    plausible-but-wrong input descriptions).
+12. **Outputs** — what the final model's actual output/target is (one real option among
+    plausible-but-wrong output descriptions).
+13. **Evaluation metric** — how the notebook evaluated model performance (one real option
+    among plausible unused metric names).
+14. **Metric interpretation** — a worked example using the notebook's own reported metric
+    value (e.g. "the notebook reports a cross-validated AUC-ROC around 0.53-0.58 — what
+    does that mean?"), testing whether the candidate can interpret the number rather than
+    just naming the metric.
 
 This is the complete question set — there are no other slots (no EDA-code, training-code,
 outline, or production questions).
 
 ### Configuration
 
-- Question count varies: 6 questions, plus `label_followup` (making 7) if `label_exists`
-  was answered correctly ("No") — there's no time limit or question-count setting to
-  configure.
+- Question count varies: 13 questions, plus `label_followup` (making 14) if
+  `label_exists` was answered correctly ("No") — there's no time limit or
+  question-count setting to configure.
 - The per-slot instructions live in `SLOT_INSTRUCTIONS` in `app_pages/notebook_quiz.py`;
-  the task description shown to the model is in `TASK_CONTEXT`; the fixed option lists
-  (`FIXED_MODEL_OPTIONS`, `FIXED_IO_DISTRACTORS`) are also there.
+  the task description shown to the model is in `TASK_CONTEXT`; the fixed option list
+  (`FIXED_MODEL_OPTIONS`) and the fixed (non-LLM) question builders (`num_employees_question`,
+  `row_granularity_question`, `label_exists_question`, `io_overlap_ok_question`) are also
+  there.
 - `MODEL` in `app_pages/notebook_quiz.py` defaults to `gpt-4o`; swap to `gpt-4o-mini`
   for cheaper/faster test iteration.
 
