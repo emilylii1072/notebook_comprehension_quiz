@@ -85,19 +85,41 @@ FOLLOWUP_SUBJECT_FOR_TRIGGER = {
 SLOT_INSTRUCTIONS = {
     "aggregation": """\
 1. aggregation — Ask: "How did the notebook aggregate the dataset's rows (which \
-start as one row per employee per week) before using them to train the model?" All \
-4 options must use plausible, technical data-preparation terminology (e.g., \
-averaging metrics across weeks, taking only the most recent week, summing across \
-weeks, computing rolling/trailing statistics) and sound reasonable; exactly one \
-must describe what the notebook actually did, the other three must be \
-plausible-but-wrong aggregation approaches it did NOT use.""",
+start as one row per employee per week) before using them to train the model?" \
+Each option must name a SPECIFIC, technically real aggregation strategy applied per \
+employee across the 35 weekly rows -- a strategy a competent data scientist could \
+plausibly have implemented for this exact task -- not a vague, nonsensical, or \
+obviously-wrong placeholder. All 4 options must share comparable sentence \
+structure, technical specificity, and length so the correct one isn't identifiable \
+just by how it's phrased; only the actual aggregation method should differ between \
+them. Exactly one must describe what the notebook actually did; the other three \
+must be real, sound aggregation strategies the notebook did NOT use.
+
+Style example (illustrative only -- note every option is phrased with the same \
+structure and level of technical detail, so none stands out as the obviously fake \
+one):
+A. Grouped rows by employee and averaged each metric across all 35 weekly rows, producing one row per employee.
+B. Grouped rows by employee and kept only the single most recent week's row, discarding all earlier weeks.
+C. Grouped rows by employee and computed a 4-week trailing average ending at the most recent week, producing one row per employee.
+D. Grouped rows by employee and summed each metric across all 35 weekly rows, producing one row per employee.""",
     "train_test_split": """\
 2. train_test_split — Ask: "How did the notebook split the data into training and \
-test sets?" All 4 options must use plausible, technical terminology (e.g., a random \
-split with a given ratio, a stratified split, a time-based/chronological split, \
-cross-validation with no separate held-out test set) and sound reasonable; exactly \
-one must describe what the notebook actually did, the other three must be \
-plausible-but-wrong splitting approaches it did NOT use.""",
+test sets?" Each option must name a SPECIFIC, technically real splitting strategy -- \
+a strategy a competent data scientist could plausibly have implemented for this \
+exact task -- not a vague, nonsensical, or obviously-wrong placeholder. All 4 \
+options must share comparable sentence structure, technical specificity, and length \
+so the correct one isn't identifiable just by how it's phrased; only the actual \
+splitting method (and ratio, if applicable) should differ between them. Exactly one \
+must describe what the notebook actually did; the other three must be real, sound \
+splitting strategies the notebook did NOT use.
+
+Style example (illustrative only -- note every option is phrased with the same \
+structure and level of technical detail, so none stands out as the obviously fake \
+one):
+A. A random 80/20 train/test split using scikit-learn's train_test_split with a fixed random seed.
+B. A random 70/30 train/test split, stratified on the attrition label.
+C. A chronological split: trained on the first 25 weeks, tested on the last 10 weeks.
+D. 5-fold cross-validation with no separate held-out test set.""",
     "model_choice": """\
 3. model_choice — Determine which ONE of these four algorithms the notebook \
 actually used/chose as its (primary or recommended) attrition model: "Random \
