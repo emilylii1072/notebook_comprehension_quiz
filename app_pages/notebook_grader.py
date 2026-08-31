@@ -1,29 +1,28 @@
-"""Notebook Grader — grade many Jupyter notebooks against a rubric with ChatGPT.
+"""Notebook Grader — grade many Jupyter notebooks against a rubric with Claude Opus 5.
 
 Workflow (three tabs):
   1. Rubric & Task — upload a rubric CSV (or load a stored one) and review/edit the
      task description. The rubric CSV is handed to the model VERBATIM (never reparsed
      or transformed), so every column of grading guidance you wrote is used as-is.
   2. Grade notebooks — upload one or many `.ipynb` files; each is flattened to a
-     transcript and sent to the OpenAI API, which reads the CSV rubric and returns a
-     score + reasoning for every rubric item it finds. Results are saved per-notebook.
+     transcript and sent to the Anthropic API, which reads the CSV rubric and returns
+     a score + reasoning for every rubric item it finds. Results are saved per-notebook.
   3. Results — a summary table (section totals per notebook) and a details table
      (every rubric item + reasoning), downloadable as a multi-sheet Excel workbook.
 
 One page of the multipage app — run the app via `streamlit run app.py`.
-Auth: set OPENAI_API_KEY (e.g. in a local .env file). Supabase is optional — without
+Auth: set ANTHROPIC_API_KEY (e.g. in a local .env file). Supabase is optional — without
 it the tool still grades and exports; it just won't persist across sessions.
 """
 
 import io
-import json
 
+import anthropic
 import nbformat
-import openai
 import pandas as pd
 import streamlit as st
+from anthropic import Anthropic
 from dotenv import load_dotenv
-from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from build_report import records_from_graded, render_report
@@ -41,7 +40,8 @@ from db import (
 
 load_dotenv()
 
-MODEL = "gpt-5.5"  # swap to "gpt-5.4-mini" for cheaper/faster test iteration
+MODEL = "claude-opus-5"  # swap to "claude-sonnet-5" for cheaper/faster test iteration
+MAX_TOKENS = 32000
 MAX_OUTPUT_CHARS_PER_CELL = 1500
 DEFAULT_RUBRIC_NAME = "attrition_v1"
 
@@ -164,7 +164,7 @@ def notebook_to_text(raw: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 def grade_notebook(
-    client: OpenAI, task: str, rubric_csv: str, notebook_text: str
+    client: Anthropic, task: str, rubric_csv: str, notebook_text: str
 ) -> list[dict]:
     """Score one notebook against the rubric CSV. The CSV text is given to the model
     exactly as uploaded; the model reads it and returns one score + reasoning per
@@ -174,22 +174,32 @@ def grade_notebook(
         f"===== BEGIN NOTEBOOK TRANSCRIPT =====\n{notebook_text}\n"
         "===== END NOTEBOOK TRANSCRIPT ====="
     )
-    response = client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": build_system_prompt(task, rubric_csv)},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    choice = response.choices[0]
-    if choice.finish_reason == "content_filter":
-        raise RuntimeError("The model declined to grade this notebook (content filter).")
+    # The system prompt (study context + rubric CSV + rules) is identical for every
+    # notebook in a batch, so a cache_control breakpoint on it lets Anthropic prompt
+    # caching serve it cheaply across the batch.
     try:
-        parsed = GradeResult.model_validate(json.loads(choice.message.content))
-    except (json.JSONDecodeError, ValidationError, TypeError) as e:
-        raise RuntimeError(f"Could not parse grading JSON from the model: {e}") from e
-    if not parsed.items:
+        response = client.messages.parse(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=[{
+                "type": "text",
+                "text": build_system_prompt(task, rubric_csv),
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": user_content}],
+            output_format=GradeResult,
+        )
+    except ValidationError as e:
+        raise RuntimeError(
+            f"The model returned a malformed grading response: {e} — try again."
+        ) from e
+    if response.stop_reason == "refusal":
+        detail = getattr(response.stop_details, "explanation", None) or "safety refusal"
+        raise RuntimeError(f"The model declined to grade this notebook ({detail}).")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("The model ran out of room before finishing — try again.")
+    parsed = response.parsed_output
+    if parsed is None or not parsed.items:
         raise RuntimeError("The model returned no graded items — try again.")
 
     results = []
@@ -212,17 +222,17 @@ def call_with_errors_surfaced(fn, *args, **kwargs):
     """Run an API-calling function, converting SDK errors to readable messages."""
     try:
         return fn(*args, **kwargs)
-    except openai.AuthenticationError:
+    except anthropic.AuthenticationError:
         st.error(
-            "Authentication failed. Set the OPENAI_API_KEY environment variable "
+            "Authentication failed. Set the ANTHROPIC_API_KEY environment variable "
             "(e.g. in a local .env file) and restart the app."
         )
-    except openai.RateLimitError:
-        st.error("Rate limited (or out of quota) — check your OpenAI plan/billing and try again.")
-    except openai.APIStatusError as e:
+    except anthropic.RateLimitError:
+        st.error("Rate limited (or out of quota) — check your Anthropic plan/billing and try again.")
+    except anthropic.APIStatusError as e:
         st.error(f"API error {e.status_code}: {e.message}")
-    except openai.APIConnectionError:
-        st.error("Could not reach the OpenAI API — check your network connection.")
+    except anthropic.APIConnectionError:
+        st.error("Could not reach the Anthropic API — check your network connection.")
     except RuntimeError as e:
         st.error(str(e))
     return None
@@ -311,8 +321,8 @@ def build_excel(graded: dict) -> bytes:
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
-def get_client() -> OpenAI:
-    return OpenAI()
+def get_client() -> Anthropic:
+    return Anthropic()
 
 
 def _load_graded_from_db(rubric_name: str) -> dict:
@@ -413,7 +423,7 @@ with tab_setup:
             pd.DataFrame(
                 [
                     {"secret": name, **{k: str(v) for k, v in status[name].items()}}
-                    for name in ("SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY")
+                    for name in ("SUPABASE_URL", "SUPABASE_KEY", "ANTHROPIC_API_KEY")
                 ]
             ),
             use_container_width=True,

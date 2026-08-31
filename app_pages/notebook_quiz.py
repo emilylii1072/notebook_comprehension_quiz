@@ -6,27 +6,39 @@ generated from the candidate's own live answer); the candidate answers one quest
 at a time while a stopwatch (not a countdown — there is no time limit) tracks
 elapsed time; correct answers are never revealed until the final question breakdown.
 
+Quiz generation runs on Claude Opus 5 (Anthropic). Every LLM-authored question is
+then *self-checked*: the model takes the freshly written quiz blind (options only,
+no answer key) and reports which options are defensibly correct. Any question that
+doesn't have exactly one defensible answer — its own designated one — is sent back
+for a minimal repair (usually just rewording an over-correct distractor), then
+re-checked. See verify_quiz().
+
 One page of the multipage app — run the app via `streamlit run app.py`.
-Auth: set OPENAI_API_KEY (e.g. in a local .env file).
+Auth: set ANTHROPIC_API_KEY (e.g. in a local .env file).
 """
 
 import json
 import random
 import time
 
+import anthropic
 import nbformat
-import openai
 import streamlit as st
+from anthropic import Anthropic
 from dotenv import load_dotenv
-from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from db import get_model_followup, save_model_followup, save_quiz_result
 
 load_dotenv()
 
-MODEL = "gpt-4o"  # swap to "gpt-4o-mini" for cheaper/faster test iteration
+MODEL = "claude-opus-5"  # swap to "claude-sonnet-5" for cheaper/faster test iteration
 MAX_OUTPUT_CHARS_PER_CELL = 1500
+
+# How many repair→re-check rounds a flagged question gets before we give up and
+# just record a warning. Each round is one "take the quiz" call plus (if anything
+# is still flagged) one batched repair call.
+VERIFY_ROUNDS = 2
 
 TASK_CONTEXT = """\
 The notebook author was given this task:
@@ -53,6 +65,10 @@ discussion of production considerations."
 # The four models a candidate can be asked about. Fixed rather than LLM-invented so
 # the model_followup question bank (below) has a small, known key space.
 FIXED_MODEL_OPTIONS = ["Random Forest", "XGBoost", "Logistic Regression", "Support Vector Machine"]
+
+# Slots whose option SET is fixed (only correct_index may move during a repair):
+# model_choice's four options are the fixed list above; io_overlap is Yes/No.
+FIXED_OPTION_SLOTS = {"model_choice", "io_overlap"}
 
 # The 8 questions generated together in one batch call (generate_quiz). num_employees,
 # row_granularity, label_exists, and io_overlap_ok are separate, fixed (non-LLM)
@@ -201,7 +217,9 @@ and stated production considerations.
 - topic: a 2-4 word tag. explanation: 1-3 sentences on why the correct answer is \
 right, shown to the candidate in the question breakdown after they finish.
 - Distractors must be plausible — they mix up related concepts from the same \
-notebook — but clearly wrong to someone who understands the work.
+notebook — but clearly wrong to someone who understands the work. Critically, \
+exactly ONE option may be defensibly correct; a distractor that is also arguably \
+true makes the question unusable.
 """
 
 SYSTEM_PROMPT = (
@@ -251,6 +269,20 @@ class SingleQuestion(BaseModel):
     question: QuizQuestion
 
 
+class QuestionVerdict(BaseModel):
+    """One entry from a blind "take the quiz" pass."""
+
+    slot: str
+    defensible_option_indices: list[int]  # 0-based; every option a knowledgeable
+    #                                       reader could defend as correct
+    well_formed: bool
+    issue: str  # one sentence describing the problem, or "" if well_formed
+
+
+class QuizVerification(BaseModel):
+    verdicts: list[QuestionVerdict]
+
+
 # ---------------------------------------------------------------------------
 # Notebook parsing
 # ---------------------------------------------------------------------------
@@ -283,12 +315,10 @@ def notebook_to_text(raw: bytes) -> str:
 
 
 def notebook_prompt_prefix(notebook_text: str) -> str:
-    """The notebook wrapped for the prompt, shared verbatim by every API call.
-
-    Every call uses an identical system prompt and leads with this exact text, so
-    OpenAI's automatic prefix caching (prefixes over ~1024 tokens, unchanged across
-    requests) can apply to the follow-up and grading calls.
-    """
+    """The notebook wrapped for the prompt. Every model call leads with this exact
+    block and it carries a `cache_control` breakpoint (see _parse_call), so
+    Anthropic prompt caching applies across the batch, verify, repair, and
+    follow-up calls for one notebook."""
     return f"<notebook>\n{notebook_text}\n</notebook>"
 
 
@@ -389,19 +419,12 @@ def io_overlap_ok_question() -> QuizQuestion:
 
 
 BATCH_JSON_SCHEMA_NOTE = """\
-Respond with ONLY a single JSON object (no markdown code fences, no commentary) \
-matching this exact shape:
-{"questions": [
-  {"slot": "<one of: aggregation, train_test_split, model_choice, io_overlap, \
-inputs, outputs, metric_choice, metric_interpretation>",
-   "topic": "<2-4 word tag>", "question": "<question text, may include \\n and \
-fenced ```code``` blocks>",
-   "options": ["<A>", "<B>", ...], "correct_index": <integer>,
-   "explanation": "<1-3 sentence explanation>"}
-]}
 Return EXACTLY 8 questions, one per slot listed above, in that exact order \
-(aggregation first, metric_interpretation last). Every slot uses exactly 4 options \
-EXCEPT "io_overlap", which uses exactly 2 options: ["Yes", "No"] (either order).
+(aggregation first, metric_interpretation last). The "slot" of each question must \
+be one of: aggregation, train_test_split, model_choice, io_overlap, inputs, \
+outputs, metric_choice, metric_interpretation. Every slot uses exactly 4 options \
+EXCEPT "io_overlap", which uses exactly 2 options: ["Yes", "No"] (either order). \
+The "question" text may include newlines and fenced ```code``` blocks.
 """
 
 
@@ -409,28 +432,60 @@ EXCEPT "io_overlap", which uses exactly 2 options: ["Yes", "No"] (either order).
 # Model calls
 # ---------------------------------------------------------------------------
 
-def generate_quiz(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
+def _parse_call(
+    client: Anthropic,
+    instructions: str,
+    notebook_text: str,
+    schema: type[BaseModel],
+    max_tokens: int = 32000,
+):
+    """One structured Claude call: system prompt + cached notebook + instructions,
+    parsed into `schema`. Returns a validated `schema` instance or raises
+    RuntimeError with a user-facing message."""
+    try:
+        response = client.messages.parse(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=[{
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": notebook_prompt_prefix(notebook_text),
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {"type": "text", "text": instructions},
+                ],
+            }],
+            output_format=schema,
+        )
+    except ValidationError as e:
+        # The model's text didn't match the schema — usually a truncated response.
+        raise RuntimeError(f"The model returned a malformed response: {e} — try again.") from e
+
+    if response.stop_reason == "refusal":
+        detail = getattr(response.stop_details, "explanation", None) or "safety refusal"
+        raise RuntimeError(f"The model declined to process this notebook ({detail}).")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("The model ran out of room before finishing — try again.")
+
+    parsed = response.parsed_output
+    if parsed is None:
+        raise RuntimeError("The model returned an unparseable response — try again.")
+    return parsed
+
+
+def generate_quiz(client: Anthropic, notebook_text: str) -> list[QuizQuestion]:
     """Generate the 8 LLM-authored, static (non-follow-up) questions in one call."""
     instructions = "\n\n".join(SLOT_INSTRUCTIONS[s] for s in SLOT_ORDER)
     instructions = f"{instructions}\n\n{SHARED_REQUIREMENTS}\n{BATCH_JSON_SCHEMA_NOTE}"
-    user_content = f"{notebook_prompt_prefix(notebook_text)}\n\n{instructions}"
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    choice = response.choices[0]
-    if choice.finish_reason == "content_filter":
-        raise RuntimeError("The model declined to process this notebook (content filter).")
-
-    try:
-        quiz = Quiz.model_validate(json.loads(choice.message.content))
-    except (json.JSONDecodeError, ValidationError, TypeError) as e:
-        raise RuntimeError(f"Could not parse quiz JSON from the model: {e}") from e
+    quiz: Quiz = _parse_call(client, instructions, notebook_text, Quiz)
 
     order_index = {slot: i for i, slot in enumerate(SLOT_ORDER)}
     seen = set()
@@ -466,16 +521,218 @@ def generate_quiz(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
     # Python-side reshuffle guarantees true randomization for the fixed-option
     # slots, regardless of what order the LLM happened to emit them in.
     for q in deduped:
-        if q.slot in ("model_choice", "io_overlap"):
+        if q.slot in FIXED_OPTION_SLOTS:
             _reshuffle(q)
 
     return deduped
 
 
-def assemble_static_questions(client: OpenAI, notebook_text: str) -> list[QuizQuestion]:
-    """Generate the 8 LLM-authored questions, then interleave the 4 fixed (non-LLM)
-    questions at their fixed positions in the sequence."""
+# ---------------------------------------------------------------------------
+# Self-check: the model takes the quiz it just wrote, blind, and we repair any
+# question that doesn't have exactly one defensible answer.
+# ---------------------------------------------------------------------------
+
+TAKE_QUIZ_INSTRUCTIONS = """\
+Below is a set of multiple-choice questions that were just written about THIS \
+notebook, for a comprehension quiz its author will take. Take the quiz yourself, \
+using ONLY the notebook as the source of truth — you are checking the questions, \
+not the candidate.
+
+For each question, fill in `defensible_option_indices`: every 0-based option index \
+that a knowledgeable reader could correctly defend as a right answer, given what \
+the notebook actually does. A usable question has EXACTLY ONE defensible answer:
+  - If two or more options are each independently correct, list ALL of them.
+  - If NO option is correct — e.g. the question asks about something the notebook \
+never does — return an empty list.
+Set `well_formed` to false, with a one-sentence `issue`, for any question that has \
+zero or multiple defensible answers, is ambiguous, relies on information not in the \
+notebook, or is otherwise poorly written. Otherwise set `well_formed` to true and \
+leave `issue` as "".
+
+Return exactly one verdict per question, using the same `slot` values.
+
+QUESTIONS:
+%s
+"""
+
+REPAIR_INSTRUCTIONS = """\
+Each question below was written about THIS notebook for the author's comprehension \
+quiz, and a review found a problem: it does not have exactly one defensible correct \
+answer, or it is not well formed. Rewrite each one so that EXACTLY ONE option is \
+correct given the notebook.
+
+Rules:
+- Keep each question's `slot` and `topic`. Keep the question stem and the options \
+as close to the originals as possible — make the SMALLEST change that fixes the \
+problem.
+- `intended_correct_index` is the answer the quiz is meant to test. Keep that \
+option as the single correct answer whenever it is actually correct per the \
+notebook. When the review shows other options are ALSO correct, minimally reword \
+just those distractors so they become clearly incorrect while staying plausible \
+and comparable to the correct option in length, structure, and specificity.
+- Only if `intended_correct_index` is itself wrong per the notebook: fix that \
+option's text, or (if another listed option is the true answer) set `correct_index` \
+to it.
+- Keep the same NUMBER of options. Do NOT change the option set for a Yes/No \
+question, or for the model-choice question whose four options are fixed \
+("Random Forest", "XGBoost", "Logistic Regression", "Support Vector Machine") — \
+for those, only `correct_index` may change.
+- Keep `explanation` accurate for the final correct answer (1-3 sentences).
+
+FLAGGED QUESTIONS:
+%s
+
+Return one corrected question per entry, keyed by the same `slot`, each in the full \
+question shape (slot, topic, question, options, correct_index, explanation).
+"""
+
+
+def _take_quiz_blind(
+    client: Anthropic, notebook_text: str, questions: list[QuizQuestion]
+) -> dict[str, QuestionVerdict]:
+    """Ask the model to answer `questions` from the notebook alone (no answer key)
+    and report which options are defensible. Keyed by slot."""
+    payload = json.dumps(
+        [
+            {"slot": q.slot, "question": q.question, "options": list(q.options)}
+            for q in questions
+        ],
+        indent=2,
+    )
+    result: QuizVerification = _parse_call(
+        client, TAKE_QUIZ_INSTRUCTIONS % payload, notebook_text, QuizVerification
+    )
+    return {v.slot: v for v in result.verdicts}
+
+
+def _repair_questions(
+    client: Anthropic,
+    notebook_text: str,
+    flagged: list[tuple[QuizQuestion, QuestionVerdict]],
+) -> dict[str, QuizQuestion]:
+    """Regenerate the flagged questions so each has exactly one correct option.
+    Keyed by slot."""
+    payload = json.dumps(
+        [
+            {
+                "slot": q.slot,
+                "topic": q.topic,
+                "question": q.question,
+                "options": list(q.options),
+                "intended_correct_index": q.correct_index,
+                "explanation": q.explanation,
+                "review_defensible_indices": v.defensible_option_indices,
+                "review_issue": v.issue,
+            }
+            for q, v in flagged
+        ],
+        indent=2,
+    )
+    result: Quiz = _parse_call(
+        client, REPAIR_INSTRUCTIONS % payload, notebook_text, Quiz
+    )
+    return {q.slot: q for q in result.questions}
+
+
+def _accept_repair(original: QuizQuestion, repaired: QuizQuestion) -> QuizQuestion | None:
+    """Return the repaired question only if it still satisfies this slot's
+    structural constraints; otherwise None, so the caller keeps the original."""
+    n = len(original.options)
+    if len(repaired.options) != n or not (0 <= repaired.correct_index < n):
+        return None
+    if original.slot == "model_choice" and set(repaired.options) != set(FIXED_MODEL_OPTIONS):
+        return None
+    if original.slot == "io_overlap" and set(repaired.options) != {"Yes", "No"}:
+        return None
+    repaired.slot = original.slot
+    repaired.topic = repaired.topic or original.topic
+    return repaired
+
+
+def verify_quiz(
+    client: Anthropic,
+    notebook_text: str,
+    questions: list[QuizQuestion],
+    rounds: int = VERIFY_ROUNDS,
+) -> tuple[list[QuizQuestion], list[str]]:
+    """Take the quiz blind and repair any question that doesn't have exactly one
+    defensible answer (its own designated one). Returns the (possibly repaired)
+    questions and a list of human-readable warnings for questions that couldn't be
+    made single-answer within `rounds` repair attempts."""
+    questions = list(questions)
+    idx_by_slot = {q.slot: i for i, q in enumerate(questions)}
+    pending = list(range(len(questions)))
+    warnings: list[str] = []
+
+    for attempt in range(rounds + 1):
+        if not pending:
+            break
+        verdicts = _take_quiz_blind(client, notebook_text, [questions[i] for i in pending])
+
+        flagged: list[tuple[QuizQuestion, QuestionVerdict]] = []
+        for i in pending:
+            q = questions[i]
+            v = verdicts.get(q.slot)
+            if v is None:
+                continue  # model didn't return this slot — leave the question as-is
+            defensible = {d for d in v.defensible_option_indices if 0 <= d < len(q.options)}
+            if v.well_formed and defensible == {q.correct_index}:
+                continue  # clean
+            if attempt == rounds:
+                warnings.append(
+                    f"{q.slot}: {v.issue or 'the self-check did not converge on a single correct answer'}"
+                )
+            else:
+                flagged.append((q, v))
+
+        if not flagged:
+            break
+
+        repaired = _repair_questions(client, notebook_text, flagged)
+        next_pending: list[int] = []
+        for q, _ in flagged:
+            candidate = repaired.get(q.slot)
+            candidate = _accept_repair(q, candidate) if candidate is not None else None
+            if candidate is None:
+                warnings.append(
+                    f"{q.slot}: automated repair did not produce a valid replacement"
+                )
+                continue
+            if q.slot in FIXED_OPTION_SLOTS:
+                _reshuffle(candidate)
+            questions[idx_by_slot[q.slot]] = candidate
+            next_pending.append(idx_by_slot[q.slot])
+        pending = next_pending
+
+    return questions, warnings
+
+
+def _note_warnings(warns: list[str]) -> None:
+    """Accumulate self-check warnings on the session so the results page and the
+    downloaded JSON can report them."""
+    if warns:
+        st.session_state.generation_warnings = (
+            (st.session_state.get("generation_warnings") or []) + warns
+        )
+
+
+def _verified_single(
+    client: Anthropic, notebook_text: str, q: QuizQuestion, rounds: int = 1
+) -> QuizQuestion:
+    """verify_quiz for one dynamic follow-up (fewer rounds — the candidate is
+    waiting). Records any warnings on the session."""
+    fixed, warns = verify_quiz(client, notebook_text, [q], rounds=rounds)
+    _note_warnings(warns)
+    return fixed[0]
+
+
+def assemble_static_questions(client: Anthropic, notebook_text: str) -> list[QuizQuestion]:
+    """Generate the 8 LLM-authored questions, self-check/repair them, then
+    interleave the 4 fixed (non-LLM) questions at their fixed positions."""
     generated = generate_quiz(client, notebook_text)
+    generated, warnings = verify_quiz(client, notebook_text, generated)
+    st.session_state.generation_warnings = warnings
+
     by_slot = {q.slot: q for q in generated}
     return [
         num_employees_question(),
@@ -493,34 +750,18 @@ def assemble_static_questions(client: OpenAI, notebook_text: str) -> list[QuizQu
     ]
 
 
-def _call_single_question(client: OpenAI, notebook_text: str, instructions: str) -> QuizQuestion:
+def _call_single_question(client: Anthropic, notebook_text: str, instructions: str) -> QuizQuestion:
     """Shared plumbing for the dynamic (single-question) follow-up generators."""
-    user_content = f"{notebook_prompt_prefix(notebook_text)}\n\n{instructions}"
-    response = client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
+    wrapped: SingleQuestion = _parse_call(
+        client, instructions, notebook_text, SingleQuestion, max_tokens=8000
     )
-    choice = response.choices[0]
-    if choice.finish_reason == "content_filter":
-        raise RuntimeError(
-            "The model declined to generate a follow-up question (content filter)."
-        )
-    try:
-        wrapped = SingleQuestion.model_validate(json.loads(choice.message.content))
-    except (json.JSONDecodeError, ValidationError, TypeError) as e:
-        raise RuntimeError(f"Could not parse follow-up question JSON: {e}") from e
-
     q = wrapped.question
     if len(q.options) != 4 or not (0 <= q.correct_index < 4):
         raise RuntimeError("The generated follow-up question was malformed — try again.")
     return q
 
 
-def generate_label_followup(client: OpenAI, notebook_text: str) -> QuizQuestion:
+def generate_label_followup(client: Anthropic, notebook_text: str) -> QuizQuestion:
     """Follow-up asked only when the candidate correctly says the label is missing:
     how did THIS notebook actually address that gap."""
     instructions = f"""\
@@ -532,16 +773,15 @@ applied). Ground the correct option in exactly what the notebook did. The three 
 distractors must use plausible, technical-sounding ML/data-prep terminology \
 describing approaches the notebook did NOT take (e.g., a different simulation \
 method, a wrong labeling source, an approach that wouldn't actually work) — not \
-generic or obviously-wrong options.
+generic or obviously-wrong options, and none of them defensibly correct.
 
 {SHARED_REQUIREMENTS}
-Respond with ONLY a single JSON object (no markdown code fences, no commentary) \
-matching this exact shape:
-{{"question": {{"slot": "label_followup", "topic": "<2-4 word tag>", \
-"question": "<question text>", "options": ["<A>", "<B>", "<C>", "<D>"], \
-"correct_index": <0-3 integer>, "explanation": "<1-3 sentence explanation>"}}}}
+Produce one question with slot "label_followup", a 2-4 word topic, the question \
+text, exactly 4 options, a 0-based correct_index, and a 1-3 sentence explanation.
 """
-    return _call_single_question(client, notebook_text, instructions)
+    q = _call_single_question(client, notebook_text, instructions)
+    q = _verified_single(client, notebook_text, q)
+    return q
 
 
 def _model_followup_question_text(model_name: str, personalized: bool) -> str:
@@ -554,11 +794,11 @@ def _model_followup_question_text(model_name: str, personalized: bool) -> str:
 
 
 def generate_model_followup(
-    client: OpenAI, notebook_text: str, model_name: str, personalized: bool
+    client: Anthropic, notebook_text: str, model_name: str, personalized: bool
 ) -> QuizQuestion:
     """Benefits/restrictions question about `model_name`. Checks the shared
-    Supabase-backed question bank first; only calls the LLM (and saves the result
-    back to the bank) for a model not already stored there."""
+    Supabase-backed question bank first; only calls the LLM (self-checks it, and
+    saves the checked result back to the bank) for a model not already stored."""
     banked = get_model_followup(model_name)
     if banked is not None:
         return QuizQuestion(
@@ -574,23 +814,22 @@ def generate_model_followup(
 Write ONE multiple-choice question asking about the benefits AND restrictions of \
 using "{model_name}" for this kind of attrition-prediction task. Exactly one option \
 must be TRUE of "{model_name}"; the other three must be plausible-sounding but \
-FALSE (true of a different algorithm, or subtly incorrect). Follow the style of the \
-examples below closely: every option (correct and distractors alike) shares similar \
-sentence structure and mentions a comparable structural/technical detail of its \
-respective algorithm (trees, boosting, coefficients, kernels, etc.) paired with a \
-"but ..." limitation — so the distractors can't be spotted just by noticing which \
-option mentions "{model_name}"-specific keywords or is a different length.
+FALSE (true of a different algorithm, or subtly incorrect) — none of them \
+defensibly correct. Follow the style of the examples below closely: every option \
+(correct and distractors alike) shares similar sentence structure and mentions a \
+comparable structural/technical detail of its respective algorithm (trees, \
+boosting, coefficients, kernels, etc.) paired with a "but ..." limitation — so the \
+distractors can't be spotted just by noticing which option mentions \
+"{model_name}"-specific keywords or is a different length.
 
 {MODEL_FOLLOWUP_FEWSHOT}
 
 {SHARED_REQUIREMENTS}
-Respond with ONLY a single JSON object (no markdown code fences, no commentary) \
-matching this exact shape:
-{{"question": {{"slot": "model_followup", "topic": "<2-4 word tag>", \
-"question": "<question text>", "options": ["<A>", "<B>", "<C>", "<D>"], \
-"correct_index": <0-3 integer>, "explanation": "<1-3 sentence explanation>"}}}}
+Produce one question with slot "model_followup", a 2-4 word topic, the question \
+text, exactly 4 options, a 0-based correct_index, and a 1-3 sentence explanation.
 """
     q = _call_single_question(client, notebook_text, instructions)
+    q = _verified_single(client, notebook_text, q)
     save_model_followup(model_name, q.options, q.correct_index, q.explanation)
     q.question = _model_followup_question_text(model_name, personalized)
     return q
@@ -600,17 +839,17 @@ def call_with_errors_surfaced(fn, *args, **kwargs):
     """Run an API-calling function, converting SDK errors to readable messages."""
     try:
         return fn(*args, **kwargs)
-    except openai.AuthenticationError:
+    except anthropic.AuthenticationError:
         st.error(
-            "Authentication failed. Set the OPENAI_API_KEY environment variable "
+            "Authentication failed. Set the ANTHROPIC_API_KEY environment variable "
             "(e.g. in a local .env file) and restart the app."
         )
-    except openai.RateLimitError:
-        st.error("Rate limited (or out of quota) — check your OpenAI plan/billing and try again.")
-    except openai.APIStatusError as e:
+    except anthropic.RateLimitError:
+        st.error("Rate limited (or out of quota) — check your Anthropic plan/billing and try again.")
+    except anthropic.APIStatusError as e:
         st.error(f"API error {e.status_code}: {e.message}")
-    except openai.APIConnectionError:
-        st.error("Could not reach the OpenAI API — check your network connection.")
+    except anthropic.APIConnectionError:
+        st.error("Could not reach the Anthropic API — check your network connection.")
     except RuntimeError as e:
         st.error(str(e))
     return None
@@ -631,8 +870,8 @@ def reset():
 
 
 @st.cache_resource
-def get_client() -> OpenAI:
-    return OpenAI()
+def get_client() -> Anthropic:
+    return Anthropic()
 
 
 def build_items(static_questions: list[QuizQuestion]) -> list:
@@ -717,7 +956,10 @@ if st.session_state.stage == "upload":
             st.error("The notebook appears to be empty.")
             st.stop()
 
-        with st.spinner("Reading the notebook and generating questions… (~1 minute)"):
+        with st.spinner(
+            "Reading the notebook, writing questions, and self-checking each one… "
+            "(~2 minutes)"
+        ):
             static_questions = call_with_errors_surfaced(
                 assemble_static_questions, get_client(), notebook_text
             )
@@ -848,6 +1090,13 @@ elif st.session_state.stage == "results":
             st.markdown(f"- **Why:** {q.explanation}")
             st.markdown(f"- **Time spent:** {t:.0f}s" if t is not None else "- **Time spent:** _unknown_")
 
+    gen_warnings = st.session_state.get("generation_warnings") or []
+    if gen_warnings:
+        st.caption(
+            "⚠️ Self-check could not fully resolve "
+            f"{len(gen_warnings)} question(s): " + "; ".join(gen_warnings)
+        )
+
     question_records = [
         {
             "slot": q.slot,
@@ -867,6 +1116,7 @@ elif st.session_state.stage == "results":
         "total": total,
         "elapsed_seconds": round(st.session_state.elapsed, 1),
         "questions": question_records,
+        "generation_warnings": gen_warnings,
     }
 
     if "db_save_attempted" not in st.session_state:

@@ -73,7 +73,7 @@ def supabase_status() -> dict:
     except Exception as e:
         info["secrets_error"] = str(e)  # no secrets.toml at all (normal locally)
 
-    for name in ("SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY"):
+    for name in ("SUPABASE_URL", "SUPABASE_KEY", "ANTHROPIC_API_KEY"):
         in_secrets = name in info["top_level_secrets"]
         value = _get_secret(name)
         info[name] = {

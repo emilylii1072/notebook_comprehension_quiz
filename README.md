@@ -2,16 +2,17 @@
 
 A multipage Streamlit app with three tools:
 
-1. **Notebook Quiz** — generates a comprehension quiz from an uploaded Jupyter notebook.
-2. **Notebook Grader** — grades many uploaded notebooks against a rubric CSV with the
-   OpenAI API and exports scores + reasoning to Excel.
+1. **Notebook Quiz** — generates a comprehension quiz from an uploaded Jupyter notebook
+   with Claude Opus 5, and self-checks every question before the candidate sees it.
+2. **Notebook Grader** — grades many uploaded notebooks against a rubric CSV with
+   Claude Opus 5 and exports scores + reasoning to Excel.
 3. **Session Timeline** — visualizes a Claude Code session `.jsonl` as an interactive
    swimlane timeline.
 
 ```powershell
 pip install -r requirements.txt
 # create a .env file with:
-#   OPENAI_API_KEY = "sk-..."        (needed for Notebook Quiz and Notebook Grader)
+#   ANTHROPIC_API_KEY = "sk-ant-..."   (needed for Notebook Quiz and Notebook Grader)
 #   SUPABASE_URL = "https://xxxx.supabase.co"   (optional -- see Database section below)
 #   SUPABASE_KEY = "..."                          (service_role key, not anon)
 python -m streamlit run app.py
@@ -72,26 +73,38 @@ and export any of these tables — no admin page needed.
 ## Notebook Quiz (`app_pages/notebook_quiz.py`)
 
 A Streamlit tool for dynamic evaluation of the **employee attrition model** take-home task.
-The quiz-taker uploads the Jupyter notebook they submitted; an OpenAI model generates a quiz
+The quiz-taker uploads the Jupyter notebook they submitted; **Claude Opus 5** generates a quiz
 grounded in that specific notebook, mixing fixed/static questions with a couple of questions
 personalized to the candidate's own answers; answers are scored against the generated key and
 shown in a per-question breakdown. There is no time limit — a stopwatch just tracks how long
 the candidate takes.
 
+**Self-check.** Every LLM-authored question is verified before the candidate sees it: the
+model takes the freshly written quiz blind (options only, no answer key) and reports which
+options are defensibly correct given the notebook. Any question that doesn't have *exactly
+one* defensible answer — its own designated one — is sent back for a minimal repair (usually
+just rewording an over-correct distractor, or, for the fixed Yes/No and model-choice slots,
+flipping the marked answer), then re-checked, up to `VERIFY_ROUNDS` times. Questions the
+self-check still can't resolve are surfaced as a warning on the results page and in the
+downloaded JSON (`generation_warnings`), not silently shipped.
+
 ### How it works
 
 1. **Upload** — the candidate uploads their `.ipynb`. The app flattens markdown, code,
    and (truncated) cell outputs into a transcript.
-2. **Generate** — the model generates 8 static questions in one batch call
+2. **Generate** — Claude Opus 5 generates 8 static questions in one batch call
    (`aggregation`, `train_test_split`, `model_choice`, `io_overlap`, `inputs`,
    `outputs`, `metric_choice`, `metric_interpretation`), following a fixed per-slot
    template (see below) so difficulty and coverage are consistent across notebooks and
-   runs. JSON-mode output plus Pydantic validation guarantee well-formed questions. 4
-   more fixed, not-LLM-generated questions (`num_employees`, `row_granularity`,
-   `label_exists`, `io_overlap_ok`) are interleaved at fixed points in the sequence —
-   their correct answers don't depend on the notebook's content. The correct answer and
-   explanation are generated/fixed up front along with each question, but never shown
-   to the candidate until the final breakdown.
+   runs. Structured outputs (`messages.parse` against a Pydantic schema) guarantee
+   well-formed questions. Then the **self-check** runs (see above): the model takes the
+   quiz blind and any question without exactly one defensible answer is repaired and
+   re-checked. 4 more fixed, not-LLM-generated questions (`num_employees`,
+   `row_granularity`, `label_exists`, `io_overlap_ok`) are interleaved at fixed points
+   in the sequence — their correct answers don't depend on the notebook's content, so
+   they skip both generation and the self-check. The correct answer and explanation are
+   generated/fixed up front along with each question, but never shown to the candidate
+   until the final breakdown.
 3. **Quiz** — questions are presented one at a time; a stopwatch (not a countdown) shows
    elapsed time, with no limit and no auto-submit. Two questions are personalized live,
    based on the candidate's own preceding answer:
@@ -103,15 +116,17 @@ the candidate takes.
      candidate's chosen model]?" First checked against the `model_followup_bank`
      Supabase table (pre-seeded for Logistic Regression / Random Forest / XGBoost); on
      a miss, the LLM generates 4 plausible options (distractors echo the model's own
-     name/keywords so the correct answer isn't obvious by elimination) and the result is
-     cached back into the bank via upsert for reuse by future candidates. Options are
-     reshuffled on every read so the answer position varies.
+     name/keywords so the correct answer isn't obvious by elimination), the self-check
+     runs on it, and the checked result is cached back into the bank via upsert for
+     reuse by future candidates. Options are reshuffled on every read so the answer
+     position varies. Both live follow-ups are self-checked (one repair round, since
+     the candidate is waiting).
 
    Unanswered questions score zero.
 4. **Results** — the score is computed against the answer key and shown as a
    per-question breakdown (your answer, the correct answer, why, and time spent on
-   that question). Results — including per-question time spent — are downloadable as
-   JSON.
+   that question). Results — including per-question time spent and any
+   `generation_warnings` from the self-check — are downloadable as JSON.
 
 ### Question template (fixed slots, in order)
 
@@ -165,14 +180,19 @@ outline, or production questions).
   (`FIXED_MODEL_OPTIONS`) and the fixed (non-LLM) question builders (`num_employees_question`,
   `row_granularity_question`, `label_exists_question`, `io_overlap_ok_question`) are also
   there.
-- `MODEL` in `app_pages/notebook_quiz.py` defaults to `gpt-4o`; swap to `gpt-4o-mini`
-  for cheaper/faster test iteration.
+- `MODEL` in `app_pages/notebook_quiz.py` defaults to `claude-opus-5`; swap to
+  `claude-sonnet-5` for cheaper/faster test iteration. `VERIFY_ROUNDS` (default 2) caps
+  how many repair→re-check rounds a flagged question gets during the self-check.
+- Auth: set `ANTHROPIC_API_KEY` (local `.env` or the deployment's secrets manager).
 
 ### Notes
 
-- All API calls share an identical system prompt and lead with the same notebook text,
-  so OpenAI's automatic prompt-prefix caching can apply across the batch and follow-up
-  calls.
+- All API calls share an identical system prompt and lead with the same notebook block,
+  which carries a `cache_control` breakpoint, so Anthropic prompt caching applies across
+  the batch, self-check, repair, and follow-up calls for one notebook.
+- Generation now costs several calls per notebook instead of one (batch → take-quiz →
+  repair → re-check, then the same for each live follow-up), so the "Generate quiz" step
+  takes ~2 minutes rather than ~1.
 - The two personalized follow-ups (`label_followup`, `model_followup`) are generated
   mid-quiz, based on the candidate's own answer to the preceding question.
   `model_followup` prefers the Supabase bank over calling the LLM; `label_followup` is
@@ -185,17 +205,22 @@ outline, or production questions).
   a skipped follow-up is excluded from scoring rather than counted wrong.
 - Very large cell outputs are truncated at 1,500 characters per cell (marked
   `[output truncated]`); code and markdown are never truncated.
-- Quiz generation uses `response_format: json_object` plus Pydantic validation rather
-  than a provider-specific structured-output helper, so malformed responses raise a
-  clear, user-facing error instead of a crash.
+- Quiz generation uses the Anthropic SDK's structured outputs (`client.messages.parse`
+  against a Pydantic schema), so the model's response is schema-validated and malformed
+  or refused responses raise a clear, user-facing error instead of a crash.
+- The self-check is a genuine blind attempt, not a rubber stamp: the model only sees the
+  question stems and options (never the answer key), and reports every option it would
+  accept as correct. A question passes only when that set is exactly `{correct_index}`.
+  Distractors are tuned, not the intended answer — the repair keeps the designated
+  correct option and minimally rewords whichever distractors turned out to be also-true.
 
 ---
 
 ## Notebook Grader (`app_pages/notebook_grader.py`)
 
-A Streamlit tool for grading **many** submitted notebooks against a rubric with the
-OpenAI API, and exporting scores + reasoning to Excel. Built for grading a batch of
-take-home submissions consistently.
+A Streamlit tool for grading **many** submitted notebooks against a rubric with
+**Claude Opus 5**, and exporting scores + reasoning to Excel. Built for grading a batch
+of take-home submissions consistently.
 
 ### How it works
 
@@ -208,11 +233,15 @@ The page has three tabs:
    full/partial/low-credit descriptions, etc.) reaches the grader intact. Rubric + task
    are saved to Supabase under a name and can be reloaded later.
 2. **Grade notebooks** — upload one or many `.ipynb` files. Each notebook is flattened
-   to a transcript and graded in its **own** OpenAI API call: the model reads the rubric
-   CSV and returns, for every rubric item, a numeric score (0…the item's max, clamped)
-   and 1–3 sentences of reasoning citing specific evidence in the notebook. Each result
-   is saved per-notebook (upsert on rubric + filename, so re-uploading a filename
-   re-grades it). A progress bar tracks the batch; you can upload more notebooks any time.
+   to a transcript and graded in its **own** API call (`client.messages.parse` against
+   the `GradeResult` schema): the model reads the rubric CSV and returns, for every
+   rubric item, a numeric score (0…the item's max, clamped) and 1–3 sentences of
+   reasoning citing specific evidence in the notebook. The system prompt (study context
+   + rubric CSV + rules) is identical across a batch and carries a `cache_control`
+   breakpoint, so Anthropic prompt caching serves it cheaply for every notebook after
+   the first. Each result is saved per-notebook (upsert on rubric + filename, so
+   re-uploading a filename re-grades it). A progress bar tracks the batch; you can
+   upload more notebooks any time.
 3. **Results** — a **Summary** table (one row per notebook: per-section totals, grand
    total, max, percent) and a **Details** table (every notebook × rubric item, with the
    reasoning), plus a **Download Excel** button producing a two-sheet workbook
@@ -226,8 +255,8 @@ The page has three tabs:
   section names the model copies back from the CSV. With a clean, consistent CSV this is
   stable; the table builders tolerate minor row differences across notebooks.
 - One API call per notebook, all rubric items at once. For a large batch this is the
-  main cost driver — switch `MODEL` in `app_pages/notebook_grader.py` to `gpt-4o-mini`
-  for cheaper/faster grading.
+  main cost driver — switch `MODEL` in `app_pages/notebook_grader.py` to
+  `claude-sonnet-5` for cheaper/faster grading. Auth: set `ANTHROPIC_API_KEY`.
 - Scores are clamped into `[0, max_pts]` server-side, so a model that returns an
   over-max score can't inflate a total.
 - Excel export uses `openpyxl` (in `requirements.txt`).
@@ -295,7 +324,7 @@ walk through them yourself:
 4. Before (or right after) the first deploy, open the app's **Settings → Secrets**
    in the Streamlit Cloud dashboard and paste in TOML-formatted secrets, e.g.:
    ```toml
-   OPENAI_API_KEY = "sk-..."
+   ANTHROPIC_API_KEY = "sk-ant-..."
    SUPABASE_URL = "https://xxxx.supabase.co"
    SUPABASE_KEY = "..."
    ```

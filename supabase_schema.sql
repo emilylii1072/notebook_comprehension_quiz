@@ -92,7 +92,7 @@ create table if not exists grading_rubric (
 
 alter table grading_rubric enable row level security;
 
--- One graded notebook: the flattened transcript plus ChatGPT's per-item scores and
+-- One graded notebook: the flattened transcript plus the model's per-item scores and
 -- reasoning. Uniqueness on (rubric_name, notebook_filename) means re-uploading the
 -- same notebook under the same rubric re-grades it (upsert) rather than duplicating.
 create table if not exists graded_notebooks (
