@@ -24,9 +24,11 @@ from db import (
     get_rubric,
     get_secret,
     list_graded_participant_notebooks,
+    list_participant_logs_raw,
     list_participant_summaries,
     list_pending_grading,
     list_rubrics,
+    save_participant_log,
     save_participant_transcript,
     save_rubric,
     set_participant_grading_error,
@@ -222,13 +224,20 @@ with tab_detail:
         st.markdown("### Session timeline")
         log = bundle["log"]
         if log and log.get("raw_jsonl"):
-            metrics = log.get("metrics") or compute_log_metrics(parse_jsonl(log["raw_jsonl"]))
+            metrics = compute_log_metrics(parse_jsonl(log["raw_jsonl"]))  # recompute live
             mc = st.columns(4)
-            mc[0].metric("Duration", f"{(metrics.get('session_duration_s') or 0) / 60:.1f} min")
-            mc[1].metric("Tool calls", metrics.get("n_tool_calls", 0))
-            mc[2].metric("File edits", metrics.get("n_edits", 0))
-            ttf = metrics.get("time_to_first_tool_call_s")
-            mc[3].metric("To 1st tool", f"{ttf:.0f}s" if ttf is not None else "—")
+            dur = (metrics.get("session_duration_s") or 0) / 60
+            mc[0].metric("Duration", f"{dur:.1f} min")
+            if metrics.get("format") == "history":
+                mc[1].metric("Prompts", metrics.get("n_substantive_prompts", 0))
+                mc[2].metric("Sessions", metrics.get("n_sessions", 0))
+                g = metrics.get("median_inter_prompt_gap_s")
+                mc[3].metric("Median gap", f"{g:.0f}s" if g is not None else "—")
+            else:
+                mc[1].metric("Tool calls", metrics.get("n_tool_calls", 0))
+                mc[2].metric("File edits", metrics.get("n_edits", 0))
+                ttf = metrics.get("time_to_first_tool_call_s")
+                mc[3].metric("To 1st tool", f"{ttf:.0f}s" if ttf is not None else "—")
             render_timeline(log["raw_jsonl"], key=sid)
         else:
             st.caption("No session log on file.")
@@ -324,6 +333,22 @@ with tab_grading:
             ok, msg = _grade_one(row["subject_id"], row["notebook_text"])
             st.write(f"{'✅' if ok else '⚠️'} {row['subject_id']}: {msg}")
         prog.progress(1.0, text="Done.")
+        st.rerun()
+
+    st.divider()
+    st.markdown("#### Re-parse session logs")
+    st.caption(
+        "Recompute the stored behaviour metrics for every session log — run this "
+        "after a parser change or if the Overview shows stale numbers."
+    )
+    if st.button("Re-parse all logs"):
+        logs = list_participant_logs_raw()
+        n = 0
+        for row in logs:
+            m = compute_log_metrics(parse_jsonl(row["raw_jsonl"]))
+            ok, _ = save_participant_log(row["subject_id"], row["filename"], row["raw_jsonl"], m)
+            n += int(ok)
+        st.success(f"Re-parsed {n}/{len(logs)} log(s).")
         st.rerun()
 
     st.divider()
