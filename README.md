@@ -67,11 +67,16 @@ Claude Opus 5 generates a quiz grounded in the participant's own notebook: 8
 LLM-authored questions (aggregation, train/test split, model choice, input/output
 overlap, inputs, outputs, evaluation metric, metric interpretation) plus 4 fixed
 non-LLM questions and up to 2 live follow-ups personalised to the participant's own
-answers. Every LLM-authored question is **self-checked** — the model takes the fresh
-quiz blind and any question without exactly one defensible answer is repaired and
-re-checked. Unresolved questions are recorded as `generation_warnings`. Logic lives
-in `lib/quiz.py`; the in-app flow and the admin's read-only breakdown are in
-`lib/quiz_ui.py`.
+answers. Five slots (aggregation, train/test split, inputs, outputs, evaluation
+metric) draw their distractors **verbatim from a hardcoded pool** (`DISTRACTOR_BANK`
+in `lib/quiz.py`); the model only picks which pool entry matches the notebook — or
+writes the correct option itself, held to the pool's length and detail — so the
+correct answer never stands out by being the most specific option. Every LLM-authored
+question is then **self-checked** — the model takes the fresh quiz blind and any
+question without exactly one defensible answer (or whose correct option is a
+specificity giveaway) is repaired and re-checked. Unresolved questions are recorded
+as `generation_warnings`. Logic lives in `lib/quiz.py`; the in-app flow and the
+admin's read-only breakdown are in `lib/quiz_ui.py`.
 
 ## Notebook grading
 

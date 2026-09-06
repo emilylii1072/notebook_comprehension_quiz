@@ -15,6 +15,7 @@ Auth: set ANTHROPIC_API_KEY (e.g. in a local .env file).
 
 import json
 import random
+import re
 
 import anthropic
 import streamlit as st
@@ -58,6 +59,56 @@ FIXED_MODEL_OPTIONS = ["Random Forest", "XGBoost", "Logistic Regression", "Suppo
 # Slots whose option SET is fixed (only correct_index may move during a repair).
 FIXED_OPTION_SLOTS = {"model_choice", "io_overlap"}
 
+# Hardcoded distractor pools. For these slots the distractors are taken VERBATIM
+# from the pool (three that the notebook did NOT do); the correct option is a pool
+# entry when one fits and otherwise a model-written sentence held to the pool's
+# length and specificity. This keeps distractor quality and detail level consistent
+# across notebooks and stops the correct answer from standing out by being the most
+# specific option. generate_quiz snaps each banked question's options back onto the
+# pool (see _snap_banked_options).
+DISTRACTOR_BANK: dict[str, list[str]] = {
+    "aggregation": [
+        "Grouped rows by employee and averaged each metric across all 35 weekly rows, producing one row per employee.",
+        "Grouped rows by employee and summed each metric across all 35 weekly rows, producing one row per employee.",
+        "Grouped rows by employee and kept only the most recent week's row, discarding the earlier weeks.",
+        "Grouped rows by employee and used a trailing multi-week average ending at the most recent week.",
+        "Grouped rows by employee and took the median of each metric across all 35 weekly rows.",
+        "Grouped rows by employee and used the slope of a linear trend fitted to each metric over the 35 weeks.",
+        "Did not aggregate: kept all 35 weekly rows per employee as separate training examples.",
+    ],
+    "train_test_split": [
+        "A random 80/20 train/test split using a fixed random seed.",
+        "A random 70/30 train/test split, stratified on the attrition label.",
+        "A chronological split: earlier weeks for training, the latest weeks held out for testing.",
+        "5-fold cross-validation with no separate held-out test set.",
+        "A grouped split by employee, so no employee appears in both training and test.",
+        "A random 90/10 train/test split with no fixed seed.",
+    ],
+    "inputs": [
+        "The per-employee aggregated behavioural metrics from Viva Insights.",
+        "The behavioural metrics together with the attrition label or the score used to build it.",
+        "Employee and organisational identifiers rather than behavioural metrics.",
+        "The un-aggregated weekly rows fed to the model as-is.",
+        "A small subset of metrics hand-picked by their correlation with the attrition label.",
+    ],
+    "outputs": [
+        "A predicted probability of attrition per employee (with an implied yes/no class).",
+        "A ranked list of feature importances showing which behaviours drive attrition.",
+        "A predicted number of weeks until each employee is expected to leave.",
+        "A predicted value of a workplace metric (such as after-hours hours) used as a burnout proxy.",
+        "A low / medium / high risk-tier label rather than a probability or class.",
+    ],
+    "metric_choice": [
+        "Cross-validated ROC-AUC on the training set, reported as a mean across folds.",
+        "Accuracy and a confusion matrix on a held-out test set.",
+        "Precision, recall and F1 at a 0.5 threshold on a held-out test set.",
+        "Training-vs-test log-loss compared to check for overfitting.",
+        "A single train/test ROC-AUC with no cross-validation.",
+        "A calibration curve comparing predicted probabilities to observed attrition rates.",
+    ],
+}
+BANKED_SLOTS = set(DISTRACTOR_BANK)
+
 SLOT_ORDER = [
     "aggregation",
     "train_test_split",
@@ -84,40 +135,16 @@ SLOT_INSTRUCTIONS = {
     "aggregation": """\
 1. aggregation — Ask: "How did the notebook aggregate the dataset's rows (which \
 start as one row per employee per week) before using them to train the model?" \
-Each option must name a SPECIFIC, technically real aggregation strategy applied per \
-employee across the 35 weekly rows -- a strategy a competent data scientist could \
-plausibly have implemented for this exact task -- not a vague, nonsensical, or \
-obviously-wrong placeholder. All 4 options must share comparable sentence \
-structure, technical specificity, and length so the correct one isn't identifiable \
-just by how it's phrased; only the actual aggregation method should differ between \
-them. Exactly one must describe what the notebook actually did; the other three \
-must be real, sound aggregation strategies the notebook did NOT use.
-
-Style example (illustrative only -- note every option is phrased with the same \
-structure and level of technical detail, so none stands out as the obviously fake \
-one):
-A. Grouped rows by employee and averaged each metric across all 35 weekly rows, producing one row per employee.
-B. Grouped rows by employee and kept only the single most recent week's row, discarding all earlier weeks.
-C. Grouped rows by employee and computed a 4-week trailing average ending at the most recent week, producing one row per employee.
-D. Grouped rows by employee and summed each metric across all 35 weekly rows, producing one row per employee.""",
+This slot has a POOL (below). Use exactly 3 POOL entries VERBATIM as the distractors \
+(pick ones the notebook did NOT do), and for the correct option use the POOL entry \
+that matches the notebook verbatim -- or, only if none fits, one sentence of your \
+own at the same length and detail as the POOL entries.""",
     "train_test_split": """\
 2. train_test_split — Ask: "How did the notebook split the data into training and \
-test sets?" Each option must name a SPECIFIC, technically real splitting strategy -- \
-a strategy a competent data scientist could plausibly have implemented for this \
-exact task -- not a vague, nonsensical, or obviously-wrong placeholder. All 4 \
-options must share comparable sentence structure, technical specificity, and length \
-so the correct one isn't identifiable just by how it's phrased; only the actual \
-splitting method (and ratio, if applicable) should differ between them. Exactly one \
-must describe what the notebook actually did; the other three must be real, sound \
-splitting strategies the notebook did NOT use.
-
-Style example (illustrative only -- note every option is phrased with the same \
-structure and level of technical detail, so none stands out as the obviously fake \
-one):
-A. A random 80/20 train/test split using scikit-learn's train_test_split with a fixed random seed.
-B. A random 70/30 train/test split, stratified on the attrition label.
-C. A chronological split: trained on the first 25 weeks, tested on the last 10 weeks.
-D. 5-fold cross-validation with no separate held-out test set.""",
+test sets?" This slot has a POOL (below). Use exactly 3 POOL entries VERBATIM as the \
+distractors (ones the notebook did NOT do), and for the correct option use the POOL \
+entry that matches the notebook verbatim -- or, only if none fits, one sentence of \
+your own at the same length and detail as the POOL entries.""",
     "model_choice": """\
 3. model_choice — Determine which ONE of these four algorithms the notebook \
 actually used/chose as its (primary or recommended) attrition model: "Random \
@@ -140,26 +167,24 @@ notebook's final model — the option "Yes" if there is overlap/leakage, "No" if
 inputs and output are cleanly separated. Answer based on what the notebook's final \
 model actually does, not a hypothetical.""",
     "inputs": """\
-5. inputs — Ask: "What are the inputs (features) of the final model?" Phrase the \
-correct option as a short, specific description of the actual input features the \
-notebook's final model uses. The three distractors must be plausible-but-wrong \
-descriptions of the inputs — e.g., including the label/target as an input, using \
-identifiers instead of behavioral features, or naming a feature set the notebook \
-did not actually use.""",
+5. inputs — Ask: "What are the inputs (features) of the final model?" This slot has \
+a POOL (below). Use exactly 3 POOL entries VERBATIM as the distractors (ones that \
+are false for this notebook), and for the correct option use the POOL entry that \
+matches the notebook -- or, only if none fits, one sentence of your own at the same \
+length and detail as the POOL entries. Do NOT list the notebook's exact column \
+names; describe the feature set at the POOL's level of generality.""",
     "outputs": """\
-6. outputs — Ask: "What is the output (target) of the final model?" Phrase the \
-correct option as a short, specific description of the actual output the \
-notebook's final model produces (e.g., a predicted probability or class of \
-attrition). The three distractors must be plausible-but-wrong descriptions of the \
-output — e.g., a predicted leave-date, feature importance values, or a workplace \
-metric instead of an attrition prediction.""",
+6. outputs — Ask: "What is the output (target) of the final model?" This slot has a \
+POOL (below). Use exactly 3 POOL entries VERBATIM as the distractors (ones that are \
+false for this notebook), and for the correct option use the POOL entry that matches \
+the notebook -- or, only if none fits, one sentence of your own at the same length \
+and detail as the POOL entries.""",
     "metric_choice": """\
-7. metric_choice — Ask: "How did the notebook evaluate the attrition models' \
-performance?" All 4 options must use plausible, technical evaluation terminology \
-(e.g., specific metric names, cross-validation, a held-out test set, a confusion \
-matrix) and sound reasonable; exactly one must describe what the notebook actually \
-did to evaluate performance, the other three must be plausible-but-wrong evaluation \
-approaches it did NOT use.""",
+7. metric_choice — Ask: "How did the notebook evaluate the attrition model's \
+performance?" This slot has a POOL (below). Use exactly 3 POOL entries VERBATIM as \
+the distractors (evaluation approaches the notebook did NOT use), and for the \
+correct option use the POOL entry that matches the notebook -- or, only if none \
+fits, one sentence of your own at the same length and detail as the POOL entries.""",
     "metric_interpretation": """\
 8. metric_interpretation — Identify the notebook's actual evaluation metric AND its \
 actual reported value or range (e.g., "cross-validated AUC-ROC scores around \
@@ -202,6 +227,18 @@ right, shown to the candidate in the question breakdown after they finish.
 notebook — but clearly wrong to someone who understands the work. Critically, \
 exactly ONE option may be defensibly correct; a distractor that is also arguably \
 true makes the question unusable.
+- The correct option must NOT stand out. Match the distractors' length, sentence \
+structure, and level of technical detail exactly. Never put a notebook-specific \
+identifier (an exact column name, random seed, row/employee count, or metric value) \
+in the correct option unless the distractors carry the same kind of detail. A \
+correct answer a reader could pick just because it is the most specific or detailed \
+option is a failed question — the correct answer is often the one that ends up too \
+specific, so keep it general.
+- Each distractor must be a genuinely different approach from the correct answer, \
+not a near-paraphrase of it.
+- For a slot that provides a POOL, the three distractors are copied VERBATIM from \
+that POOL (never invented), and the correct option is a POOL entry whenever one \
+fits the notebook.
 """
 
 SYSTEM_PROMPT = (
@@ -280,6 +317,45 @@ def _reshuffle(q: QuizQuestion) -> None:
     random.shuffle(order)
     q.options = [q.options[i] for i in order]
     q.correct_index = q.options.index(correct_text)
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower()).rstrip(".")
+
+
+def _slot_instruction(slot: str) -> str:
+    """The per-slot instruction, with its distractor POOL appended for banked slots."""
+    text = SLOT_INSTRUCTIONS[slot]
+    pool = DISTRACTOR_BANK.get(slot)
+    if pool:
+        text += "\n\nPOOL:\n" + "\n".join(f"- {p}" for p in pool)
+    return text
+
+
+def _snap_banked_options(q: QuizQuestion) -> None:
+    """Force a banked slot's options onto its pool: keep the model's correct option,
+    fill the other three slots with pool entries the model already picked (snapped to
+    their canonical text) plus, if short, unused pool entries. Mutates in place."""
+    pool = DISTRACTOR_BANK.get(q.slot)
+    if not pool:
+        return
+    canon = {_norm(p): p for p in pool}
+    correct = q.options[q.correct_index] if 0 <= q.correct_index < len(q.options) else pool[0]
+    correct = canon.get(_norm(correct), correct)  # snap the correct option too if it's a pool entry
+
+    distractors: list[str] = []
+    for opt in q.options:
+        c = canon.get(_norm(opt))
+        if c and c != correct and c not in distractors:
+            distractors.append(c)
+    for p in pool:
+        if len(distractors) >= 3:
+            break
+        if _norm(p) != _norm(correct) and p not in distractors:
+            distractors.append(p)
+
+    q.options = [correct, *distractors[:3]]
+    q.correct_index = 0
 
 
 def label_exists_question() -> QuizQuestion:
@@ -429,7 +505,7 @@ def _parse_call(
 
 def generate_quiz(client: Anthropic, notebook_text: str) -> list[QuizQuestion]:
     """Generate the 8 LLM-authored, static (non-follow-up) questions in one call."""
-    instructions = "\n\n".join(SLOT_INSTRUCTIONS[s] for s in SLOT_ORDER)
+    instructions = "\n\n".join(_slot_instruction(s) for s in SLOT_ORDER)
     instructions = f"{instructions}\n\n{SHARED_REQUIREMENTS}\n{BATCH_JSON_SCHEMA_NOTE}"
 
     quiz: Quiz = _parse_call(client, instructions, notebook_text, Quiz)
@@ -466,8 +542,9 @@ def generate_quiz(client: Anthropic, notebook_text: str) -> list[QuizQuestion]:
         )
 
     for q in deduped:
-        if q.slot in FIXED_OPTION_SLOTS:
-            _reshuffle(q)
+        if q.slot in BANKED_SLOTS:
+            _snap_banked_options(q)
+        _reshuffle(q)  # every slot -- option position must never be a tell
 
     return deduped
 
@@ -490,8 +567,11 @@ the notebook actually does. A usable question has EXACTLY ONE defensible answer:
 never does — return an empty list.
 Set `well_formed` to false, with a one-sentence `issue`, for any question that has \
 zero or multiple defensible answers, is ambiguous, relies on information not in the \
-notebook, or is otherwise poorly written. Otherwise set `well_formed` to true and \
-leave `issue` as "".
+notebook, or is otherwise poorly written. ALSO set `well_formed` to false if the \
+correct option is noticeably longer, more specific, or more technically detailed \
+than the distractors (a giveaway), or if any distractor is a near-paraphrase of the \
+correct option rather than a genuinely different approach. Otherwise set \
+`well_formed` to true and leave `issue` as "".
 
 Return exactly one verdict per question, using the same `slot` values.
 
@@ -521,6 +601,11 @@ to it.
 question, or for the model-choice question whose four options are fixed \
 ("Random Forest", "XGBoost", "Logistic Regression", "Support Vector Machine") — \
 for those, only `correct_index` may change.
+- For a slot with a `pool` field: fix an also-correct or paraphrased distractor by \
+REPLACING it with a different `pool` entry the notebook did NOT do (verbatim) — do \
+not reword it. Keep the correct option at the pool's length and level of detail.
+- If the review flagged the correct option as too specific / a giveaway, make it \
+LESS specific to match the distractors — do not make the distractors more specific.
 - Keep `explanation` accurate for the final correct answer (1-3 sentences).
 
 FLAGGED QUESTIONS:
@@ -566,6 +651,7 @@ def _repair_questions(
                 "explanation": q.explanation,
                 "review_defensible_indices": v.defensible_option_indices,
                 "review_issue": v.issue,
+                **({"pool": DISTRACTOR_BANK[q.slot]} if q.slot in BANKED_SLOTS else {}),
             }
             for q, v in flagged
         ],
@@ -640,8 +726,9 @@ def verify_quiz(
                     f"{q.slot}: automated repair did not produce a valid replacement"
                 )
                 continue
-            if q.slot in FIXED_OPTION_SLOTS:
-                _reshuffle(candidate)
+            if candidate.slot in BANKED_SLOTS:
+                _snap_banked_options(candidate)
+            _reshuffle(candidate)
             questions[idx_by_slot[q.slot]] = candidate
             next_pending.append(idx_by_slot[q.slot])
         pending = next_pending
