@@ -104,8 +104,10 @@ Password gate (`ADMIN_PASSWORD`). Four tabs:
    status); filter by condition; download all as CSV.
 2. **Participant** — the five markdown docs (manual vs AI side by side), the graded
    notebook (per-item scores + reasoning + transcript), the quiz breakdown, the
-   interactive session timeline with click-to-open event detail, and raw file
-   downloads. A "Grade now" button for anything still ungraded.
+   **verbal assessment** (upload a `.txt` transcript → Claude splits it into
+   timestamped question/answer pairs; not scored), the interactive session timeline
+   with click-to-open event detail, and raw file downloads. A "Grade now" button for
+   anything still ungraded.
 3. **Cohort stats** — outcome and behaviour metrics overall and split by condition
    (box + strip plots), a per-condition n / mean / sd table with a hand-rolled
    one-way ANOVA (F, p, η² — descriptive only), the manipulation checks, and a
@@ -128,6 +130,8 @@ Tables (`supabase_schema.sql`):
 - `participant_notebooks` — the `.ipynb` transcript + its rubric grading
 - `participant_quiz` — the comprehension-quiz result + per-question breakdown
 - `participant_logs` — the raw session `.jsonl` + derived metrics
+- `participant_transcripts` — the admin-uploaded verbal-assessment `.txt` + its
+  parsed timestamped Q/A pairs
 - `grading_rubric` — a task description + rubric CSV stored verbatim, keyed by name
 - `model_followup_bank` — the growing bank of quiz model-follow-up questions
 

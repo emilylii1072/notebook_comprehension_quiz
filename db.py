@@ -569,11 +569,37 @@ def get_participant(subject_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def save_participant_transcript(
+    subject_id: str, filename: str, raw_text: str, parsed: list[dict] | None
+) -> tuple[bool, str | None]:
+    """Upsert the admin-uploaded verbal-assessment transcript (one per participant)."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_transcripts").upsert(
+            {
+                "subject_id": subject_id,
+                "filename": filename,
+                "raw_text": raw_text,
+                "parsed": parsed,
+                "parsed_at": datetime.now(timezone.utc).isoformat() if parsed is not None else None,
+            },
+            on_conflict="subject_id",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def get_participant_bundle(subject_id: str) -> dict:
     """Everything stored for one participant, for the admin detail view. Missing
     pieces come back as None / [] rather than raising."""
     client = get_supabase_client()
-    empty = {"participant": None, "files": [], "notebook": None, "quiz": None, "log": None}
+    empty = {
+        "participant": None, "files": [], "notebook": None, "quiz": None,
+        "log": None, "transcript": None,
+    }
     if client is None:
         return empty
     out = dict(empty)
@@ -598,6 +624,11 @@ def get_participant_bundle(subject_id: str) -> dict:
             .eq("subject_id", subject_id).limit(1).execute().data or []
         )
         out["log"] = lg[0] if lg else None
+        tr = (
+            client.table("participant_transcripts").select("*")
+            .eq("subject_id", subject_id).limit(1).execute().data or []
+        )
+        out["transcript"] = tr[0] if tr else None
     except Exception:
         pass
     return out
@@ -628,6 +659,11 @@ def list_participant_summaries() -> list[dict]:
             r["subject_id"]: r
             for r in (client.table("participant_logs")
                       .select("subject_id,metrics").execute().data or [])
+        }
+        transcript_ids = {
+            r["subject_id"]
+            for r in (client.table("participant_transcripts")
+                      .select("subject_id").execute().data or [])
         }
     except Exception:
         return []
@@ -660,6 +696,7 @@ def list_participant_summaries() -> list[dict]:
                 "median_inter_tool_gap_s": metrics.get("median_inter_tool_gap_s"),
                 "chat_count": metrics.get("chat_count"),
                 "instruct_count": metrics.get("instruct_count"),
+                "has_transcript": sid in transcript_ids,
             }
         )
     return rows

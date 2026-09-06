@@ -182,6 +182,18 @@ create table if not exists participant_logs (
 
 alter table participant_logs enable row level security;
 
+-- Admin-uploaded transcript of the verbal free-response assessment. Not scored.
+create table if not exists participant_transcripts (
+  subject_id text primary key references participants (subject_id) on delete cascade,
+  filename text not null,
+  raw_text text not null,
+  parsed jsonb,                      -- [{"timestamp","question","answer"}, ...]
+  parsed_at timestamptz,
+  uploaded_at timestamptz not null default now()
+);
+
+alter table participant_transcripts enable row level security;
+
 
 -- ---------------------------------------------------------------------------
 -- Migrations for databases created from an earlier version of this file
