@@ -36,18 +36,28 @@ OUTCOME_METRICS = [
     ("notebook_pct", "Notebook score (%)"),
     ("quiz_pct", "Quiz score (%)"),
 ]
+# Only the columns present in the data are charted, so listing both the
+# transcript metrics and the history-file (prompt-only) equivalents is fine.
 BEHAVIOUR_METRICS = [
     ("session_duration_s", "Session duration (s)"),
     ("n_tool_calls", "Tool calls"),
     ("n_edits", "File edits"),
+    ("n_prompts", "Prompts"),
+    ("n_sessions", "Sessions (context resets)"),
     ("time_to_first_tool_call_s", "Time to first tool call (s)"),
+    ("time_to_first_prompt_s", "Time to first prompt (s)"),
     ("median_inter_tool_gap_s", "Median gap between tool calls (s)"),
+    ("median_inter_prompt_gap_s", "Median gap between prompts (s)"),
 ]
 MANIPULATION_CHECKS = [
     ("time_to_first_tool_call_s", "Time to first tool call (s)",
      "slow_planning", "expected highest under **slow planning**"),
+    ("time_to_first_prompt_s", "Time to first prompt (s)",
+     "slow_planning", "expected highest under **slow planning** (history-file proxy)"),
     ("median_inter_tool_gap_s", "Median gap between tool calls (s)",
      "slow_iterating", "expected highest under **slow iterating**"),
+    ("median_inter_prompt_gap_s", "Median gap between prompts (s)",
+     "slow_iterating", "expected highest under **slow iterating** (history-file proxy)"),
 ]
 
 

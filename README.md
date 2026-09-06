@@ -88,11 +88,21 @@ so batch grading of many notebooks is cheap after the first. Scores are clamped 
 
 ## Session-log metrics
 
-`lib/timeline.compute_log_metrics()` reduces a parsed Claude Code `.jsonl` into
-scalars: session duration, turn / prompt / tool-call / edit counts, tool breakdown,
-chat-vs-instruct split, token totals, and two **manipulation-check** metrics —
-`time_to_first_tool_call_s` (expected highest under *slow planning*) and
-`median_inter_tool_gap_s` (expected highest under *slow iterating*).
+`lib/timeline.parse_jsonl()` auto-detects two Claude Code `.jsonl` formats:
+
+- a **session transcript** (`type: user/assistant` + `tool_use` records) — the full
+  User Prompt / Agent Call / Tool Call swimlane and all tool metrics.
+- the **`history.jsonl`** command-recall file (`display` per line) — **only the
+  prompts the participant typed**; it has no assistant responses or tool calls. You
+  get a prompt-only timeline (Instruct / Chat / Slash) and prompt-based metrics.
+
+`compute_log_metrics()` returns scalars accordingly: session duration, prompt /
+session / tool-call / edit counts, chat-vs-instruct split, token totals, and the
+**manipulation-check** metrics — `time_to_first_tool_call_s` /
+`median_inter_tool_gap_s` for a transcript, or their history-file proxies
+`time_to_first_prompt_s` / `median_inter_prompt_gap_s` (both: first expected highest
+under *slow planning*, second under *slow iterating*). The Admin **Grading** tab has
+a "Re-parse all logs" button to recompute stored metrics after a parser change.
 
 ---
 

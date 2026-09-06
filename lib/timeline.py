@@ -40,7 +40,7 @@ TOOL_SYMBOL_SEQUENCE = [
     "diamond", "square", "triangle-up", "star", "hexagon", "pentagon",
     "cross", "x", "triangle-down", "hourglass", "bowtie", "diamond-cross",
 ]
-PROMPT_SYMBOL = {"Instruct": "circle", "Chat": "star"}
+PROMPT_SYMBOL = {"Instruct": "circle", "Chat": "star", "Slash": "square"}
 
 # --- Chat vs. Instruct heuristic -------------------------------------------------
 # A prompt is classified purely from surface phrasing -- no API call. This keeps the
@@ -156,21 +156,96 @@ def _assign_declump_offsets(events: list[dict]) -> None:
             e["y_offset"] = (i - (n - 1) / 2) * step
 
 
+def _first_records(raw_text: str, n: int = 8) -> list[dict]:
+    out = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _looks_like_history(raw_text: str) -> bool:
+    """The Claude Code `history.jsonl` (up-arrow recall): every line has `display`
+    and no `type`/`message`. It records only what the user typed — no assistant
+    responses, no tool calls."""
+    recs = _first_records(raw_text)
+    if not recs:
+        return False
+    return all("display" in r and "type" not in r and "message" not in r for r in recs)
+
+
+def _parse_history(raw_text: str) -> dict:
+    """Parse a Claude Code history file into User Prompt events only."""
+    events: list[dict] = []
+    skipped = 0
+    turn = 0
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(rec, dict) or "display" not in rec:
+            skipped += 1
+            continue
+        ts = rec.get("timestamp")
+        t = ts / 1000.0 if isinstance(ts, (int, float)) else _parse_timestamp(ts)
+        if t is None:
+            skipped += 1
+            continue
+        display = (rec.get("display") or "").strip()
+        pasted = rec.get("pastedContents") or {}
+        pasted_bits = []
+        for v in pasted.values():
+            if isinstance(v, dict):
+                pasted_bits.append(v.get("content") or f"[pasted block #{v.get('id', '?')}]")
+        full = display + (("\n\n" + "\n\n".join(pasted_bits)) if pasted_bits else "")
+        is_slash = display.startswith("/")
+        turn += 1
+        events.append({
+            "idx": len(events), "turn": turn, "lane": "User Prompt",
+            "t": t, "label": _preview(full or display or "(empty)"), "record": rec,
+            "text": full, "classification": "Slash" if is_slash else classify_prompt(full),
+            "session_id": rec.get("sessionId") or rec.get("session_id"),
+        })
+    _assign_declump_offsets(events)
+    return {
+        "events": events, "skipped": skipped,
+        "t0": min((e["t"] for e in events), default=None),
+        "format": "history",
+    }
+
+
 def parse_jsonl(raw_text: str) -> dict:
-    """Parse a Claude Code session JSONL transcript into a flat list of lane events.
+    """Parse a Claude Code log into a flat list of lane events.
 
-    Returns a dict with:
-      - "events": list of event dicts, each carrying at least
-        {"idx", "turn", "lane", "t", "label", "record"}, plus lane-specific fields.
-      - "skipped": count of lines that were malformed JSON or an unrecognized shape.
-      - "t0": epoch seconds of the first usable event (for relative-time display).
+    Auto-detects the format:
+      - a session *transcript* (`type: user/assistant` + `tool_use`) -> the full
+        User Prompt / Agent Call / Tool Call swimlane. `format` == "transcript".
+      - the `history.jsonl` command-recall file (`display` only) -> User Prompt
+        events only; there are no responses or tool calls in that file.
+        `format` == "history".
 
-    Event fields by lane:
-      User Prompt : "text", "classification" ("Chat" | "Instruct")
-      Agent Call  : "text", "usage" (dict of token counts, may be empty)
-      Tool Call   : "tool_name", "input" (dict), "result_text", "usage" (tokens of
-                    the parent Agent Call that invoked this tool)
+    Returns {"events", "skipped", "t0", "format"}. Event dicts carry at least
+    {"idx", "turn", "lane", "t", "label", "record"} plus lane-specific fields
+    (User Prompt: "text", "classification"; Agent Call: "text", "usage";
+    Tool Call: "tool_name", "input", "result_text", "usage").
     """
+    if _looks_like_history(raw_text):
+        return _parse_history(raw_text)
+
     events: list[dict] = []
     skipped = 0
     turn_no = 0
@@ -253,22 +328,60 @@ def parse_jsonl(raw_text: str) -> dict:
     _assign_declump_offsets(events)
 
     t0 = min((e["t"] for e in events), default=None)
-    return {"events": events, "skipped": skipped, "t0": t0}
+    return {"events": events, "skipped": skipped, "t0": t0, "format": "transcript"}
 
 
 # --- Derived metrics ------------------------------------------------------------
 
+def _history_metrics(parsed: dict) -> dict:
+    """Prompt-only metrics for a history file — Claude's responses and tool calls
+    are not in it, so every tool/agent/token field is None/0."""
+    prompts = sorted(parsed.get("events", []), key=lambda e: e["t"])
+    times = [p["t"] for p in prompts]
+    gaps = [b - a for a, b in zip(times, times[1:])] if len(times) > 1 else []
+    subst = [p for p in prompts if p["classification"] != "Slash"]
+    sessions = {p.get("session_id") for p in prompts if p.get("session_id")}
+    time_to_first = None
+    if subst and times:
+        time_to_first = round(subst[0]["t"] - times[0], 1)
+    return {
+        "format": "history",
+        "session_duration_s": round(times[-1] - times[0], 1) if len(times) > 1 else 0.0,
+        "n_turns": len(prompts),
+        "n_user_prompts": len(prompts),
+        "n_substantive_prompts": len(subst),
+        "n_slash_commands": len(prompts) - len(subst),
+        "n_new_commands": sum(1 for p in prompts if p["text"].strip().startswith("/new")),
+        "n_sessions": len(sessions) or (1 if prompts else 0),
+        "n_agent_calls": None, "n_tool_calls": None, "n_edits": None,
+        "tool_counts": {},
+        "time_to_first_prompt_s": time_to_first,
+        "time_to_first_tool_call_s": None,
+        "median_inter_prompt_gap_s": round(statistics.median(gaps), 1) if gaps else None,
+        "median_inter_tool_gap_s": None,
+        "chat_count": sum(1 for p in prompts if p["classification"] == "Chat"),
+        "instruct_count": sum(1 for p in prompts if p["classification"] == "Instruct"),
+        "tokens_in": None, "tokens_out": None, "cache_read_tokens": None,
+        "skipped_lines": parsed.get("skipped", 0),
+    }
+
+
 def compute_log_metrics(parsed: dict) -> dict:
     """Reduce a parsed session into the scalar behavioural metrics the admin views
     use. Safe on an empty/degenerate session: every field is present, zeros/None
-    where undefined.
+    where undefined. Dispatches on `parsed["format"]`.
 
-    Manipulation-check metrics:
+    Manipulation-check metrics (transcript format only):
       time_to_first_tool_call_s — planning time before the agent first acted;
         expected highest under the "slow planning" condition.
       median_inter_tool_gap_s   — typical pause between successive tool calls;
         expected highest under the "slow iterating" condition.
+    For a history file, the closest available proxies are time_to_first_prompt_s
+    and median_inter_prompt_gap_s.
     """
+    if parsed.get("format") == "history":
+        return _history_metrics(parsed)
+
     events = parsed.get("events", [])
     t0 = parsed.get("t0")
 
@@ -295,15 +408,24 @@ def compute_log_metrics(parsed: dict) -> dict:
     tokens_out = sum((a["usage"] or {}).get("output_tokens", 0) or 0 for a in agents)
     cache_read = sum((a["usage"] or {}).get("cache_read_input_tokens", 0) or 0 for a in agents)
 
+    prompt_times = sorted(p["t"] for p in prompts)
+    prompt_gaps = [b - a for a, b in zip(prompt_times, prompt_times[1:])] if len(prompt_times) > 1 else []
+
     return {
+        "format": "transcript",
         "session_duration_s": round(duration, 1),
         "n_turns": len({e["turn"] for e in events}),
         "n_user_prompts": len(prompts),
+        "n_substantive_prompts": len(prompts),
+        "n_slash_commands": 0,
+        "n_sessions": 1,
         "n_agent_calls": len(agents),
         "n_tool_calls": len(tools),
         "n_edits": sum(v for k, v in tool_counts.items() if k in EDIT_TOOLS),
         "tool_counts": tool_counts,
+        "time_to_first_prompt_s": None,
         "time_to_first_tool_call_s": time_to_first_tool,
+        "median_inter_prompt_gap_s": round(statistics.median(prompt_gaps), 1) if prompt_gaps else None,
         "median_inter_tool_gap_s": round(statistics.median(inter_gaps), 1) if inter_gaps else None,
         "mean_inter_tool_gap_s": round(statistics.fmean(inter_gaps), 1) if inter_gaps else None,
         "chat_count": sum(1 for p in prompts if p["classification"] == "Chat"),
@@ -364,8 +486,10 @@ def build_figure(parsed: dict) -> go.Figure:
         hoverinfo="text",
     ))
 
-    for kind in ("Instruct", "Chat"):
+    for kind in ("Instruct", "Chat", "Slash"):
         sub = [e for e in events if e["lane"] == "User Prompt" and e["classification"] == kind]
+        if not sub:
+            continue
         fig.add_trace(go.Scatter(
             x=[rel(e["t"]) for e in sub], y=[y_of(e) for e in sub],
             mode="markers", name=f"User Prompt ({kind})",
@@ -515,6 +639,12 @@ def render_timeline(raw_jsonl: str, key: str) -> None:
         with st.expander("First lines of the file"):
             st.code("\n".join(raw_jsonl.splitlines()[:8]) or "(empty)")
         return
+    if parsed.get("format") == "history":
+        st.caption(
+            "📜 This is the Claude Code **history file** — it records only the "
+            "prompts the participant typed. Claude's responses and tool calls are "
+            "not in this file; for those, collect the session transcript instead."
+        )
     if parsed["skipped"]:
         st.caption(f"Skipped {parsed['skipped']} unparseable/unrecognized line(s).")
 

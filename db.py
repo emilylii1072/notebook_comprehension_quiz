@@ -689,17 +689,37 @@ def list_participant_summaries() -> list[dict]:
                 "quiz_total": qz.get("total"),
                 "quiz_pct": (100 * qz["score"] / qz["total"])
                 if (qz.get("score") is not None and qz.get("total")) else None,
+                "log_format": metrics.get("format"),
                 "session_duration_s": metrics.get("session_duration_s"),
                 "n_tool_calls": metrics.get("n_tool_calls"),
                 "n_edits": metrics.get("n_edits"),
+                "n_prompts": metrics.get("n_substantive_prompts"),
+                "n_sessions": metrics.get("n_sessions"),
                 "time_to_first_tool_call_s": metrics.get("time_to_first_tool_call_s"),
+                "time_to_first_prompt_s": metrics.get("time_to_first_prompt_s"),
                 "median_inter_tool_gap_s": metrics.get("median_inter_tool_gap_s"),
+                "median_inter_prompt_gap_s": metrics.get("median_inter_prompt_gap_s"),
                 "chat_count": metrics.get("chat_count"),
                 "instruct_count": metrics.get("instruct_count"),
                 "has_transcript": sid in transcript_ids,
             }
         )
     return rows
+
+
+def list_participant_logs_raw() -> list[dict]:
+    """[{subject_id, filename, raw_jsonl}] — for re-parsing stored logs after a
+    parser change."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        return (
+            client.table("participant_logs")
+            .select("subject_id,filename,raw_jsonl").execute().data or []
+        )
+    except Exception:
+        return []
 
 
 def list_graded_participant_notebooks() -> dict:
