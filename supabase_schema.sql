@@ -92,7 +92,7 @@ create table if not exists grading_rubric (
 
 alter table grading_rubric enable row level security;
 
--- One graded notebook: the flattened transcript plus ChatGPT's per-item scores and
+-- One graded notebook: the flattened transcript plus the model's per-item scores and
 -- reasoning. Uniqueness on (rubric_name, notebook_filename) means re-uploading the
 -- same notebook under the same rubric re-grades it (upsert) rather than duplicating.
 create table if not exists graded_notebooks (
@@ -111,6 +111,76 @@ create index if not exists graded_notebooks_rubric_idx
   on graded_notebooks (rubric_name, created_at desc);
 
 alter table graded_notebooks enable row level security;
+
+
+-- ---------------------------------------------------------------------------
+-- Study participants (Participant intake + Admin review)
+-- ---------------------------------------------------------------------------
+-- Every artifact a participant produces is keyed on subject_id ("P" + 3 digits).
+-- One row per participant in every table except participant_files (one row per
+-- markdown doc). Child rows cascade-delete with the participant.
+
+create table if not exists participants (
+  subject_id text primary key,
+  condition text not null,          -- 'slow_planning' | 'slow_iterating' | 'control'
+  status text not null default 'in_progress',        -- 'in_progress' | 'complete'
+  grading_status text not null default 'pending',     -- 'pending' | 'done' | 'error'
+  grading_error text,
+  file_manifest jsonb,              -- {expected: [...], received: [...]}
+  created_at timestamptz not null default now(),
+  submitted_at timestamptz
+);
+
+alter table participants enable row level security;
+
+create table if not exists participant_files (
+  subject_id text not null references participants (subject_id) on delete cascade,
+  doc_type text not null,           -- task_plan | debug_manual | debug_ai | ideate_manual | ideate_ai
+  filename text not null,
+  content text not null,
+  uploaded_at timestamptz not null default now(),
+  primary key (subject_id, doc_type)
+);
+
+alter table participant_files enable row level security;
+
+create table if not exists participant_notebooks (
+  subject_id text primary key references participants (subject_id) on delete cascade,
+  filename text not null,
+  notebook_text text not null,
+  rubric_name text,
+  grader_model text,
+  results jsonb,                     -- [{"section","criterion","max_pts","score","reasoning"}, ...]
+  total_score numeric,
+  max_score numeric,
+  graded_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+alter table participant_notebooks enable row level security;
+
+create table if not exists participant_quiz (
+  subject_id text primary key references participants (subject_id) on delete cascade,
+  notebook_filename text,
+  score integer not null,
+  total integer not null,
+  elapsed_seconds numeric,
+  questions jsonb not null,          -- full per-question breakdown
+  generation_warnings jsonb,
+  created_at timestamptz not null default now()
+);
+
+alter table participant_quiz enable row level security;
+
+create table if not exists participant_logs (
+  subject_id text primary key references participants (subject_id) on delete cascade,
+  filename text not null,
+  raw_jsonl text not null,
+  metrics jsonb not null,            -- lib.timeline.compute_log_metrics() output
+  parsed_at timestamptz not null default now()
+);
+
+alter table participant_logs enable row level security;
 
 
 -- ---------------------------------------------------------------------------
