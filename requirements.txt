@@ -1,5 +1,6 @@
+# Streamlit Cloud rebuilds the environment when this file changes.
 streamlit>=1.37
-anthropic>=1.0
+anthropic>=1.4          # messages.parse structured outputs + long-request timeout guard
 nbformat>=5.9
 pydantic>=2.0
 python-dotenv>=1.0
