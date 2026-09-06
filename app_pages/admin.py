@@ -1,11 +1,12 @@
 """Admin — the researcher's view of every participant.
 
-Password-gated (set ADMIN_PASSWORD in secrets / .env). Four tabs:
-  1. Overview      — one row per participant, filter by condition, CSV export
-  2. Participant   — the five docs, the graded notebook, the quiz, the verbal
-                     assessment transcript, the session timeline
-  3. Cohort stats  — outcomes + behaviour overall and split by condition
-  4. Grading       — the active rubric + "grade all pending"
+Password-gated (set ADMIN_PASSWORD in secrets / .env). Five tabs:
+  1. Overview        — one row per participant, filter by condition, CSV export
+  2. Participant     — the five docs, the graded notebook, the quiz, the verbal
+                       assessment transcript, the session timeline
+  3. Cohort stats    — outcomes + behaviour overall and split by condition
+  4. Notebook report — the visual grading report across all graded notebooks
+  5. Grading         — the active rubric + "grade all pending"
 
 One page of the multipage app — run via `streamlit run app.py`.
 """
@@ -14,12 +15,15 @@ import io
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
+from build_report import records_from_graded, render_report
 from db import (
     get_participant_bundle,
     get_rubric,
     get_secret,
+    list_graded_participant_notebooks,
     list_participant_summaries,
     list_pending_grading,
     list_rubrics,
@@ -84,8 +88,9 @@ def _grade_one(subject_id: str, notebook_text: str) -> tuple[bool, str]:
     return (ok, "graded" if ok else (err or "save failed"))
 
 
-tab_overview, tab_detail, tab_cohort, tab_grading = st.tabs(
-    ["1 · Overview", "2 · Participant", "3 · Cohort stats", "4 · Grading & rubric"]
+tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
+    ["1 · Overview", "2 · Participant", "3 · Cohort stats",
+     "4 · Notebook report", "5 · Grading & rubric"]
 )
 
 # ---- Tab 1: Overview ----------------------------------------------------
@@ -250,7 +255,28 @@ with tab_detail:
 with tab_cohort:
     cohort.render_cohort(list_participant_summaries())
 
-# ---- Tab 4: Grading & rubric ----------------------------------------
+# ---- Tab 4: Notebook grading report --------------------------------
+with tab_report:
+    st.markdown(
+        "Visual review of every graded participant notebook: score distribution, "
+        "per-section spread, a notebook × criterion heatmap, the criteria the cohort "
+        "did worst on, and a clustering of scoring profiles."
+    )
+    graded = list_graded_participant_notebooks()
+    if not graded:
+        st.info("No graded notebooks yet.")
+    else:
+        records = records_from_graded(graded)
+        report_html = render_report(records, ACTIVE_RUBRIC_NAME)
+        st.download_button(
+            "⬇️ Download report (single HTML file)",
+            data=report_html, file_name=f"notebook_report_{ACTIVE_RUBRIC_NAME}.html",
+            mime="text/html",
+        )
+        # Isolated iframe: the report ships its own CSS reset + tooltip script.
+        components.html(report_html, height=2200, scrolling=True)
+
+# ---- Tab 5: Grading & rubric ----------------------------------------
 with tab_grading:
     st.markdown(
         f"Hidden-synchronous grading uses the rubric named **`{ACTIVE_RUBRIC_NAME}`** "
