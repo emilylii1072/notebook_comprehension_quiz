@@ -1,15 +1,19 @@
-"""Session Timeline — visualize a Claude Code session JSONL as an interactive swimlane
-timeline (User Prompt / Agent Call / Tool Call lanes). Click any marker to open a
-popup with that event's content, timestamp, and token usage.
+"""Parse a Claude Code session JSONL transcript, chart it as a swimlane timeline,
+and derive per-session behavioural metrics.
 
 Best-effort parser for the Claude Code transcript format: each line is a JSON object
 with a `type` ("user" | "assistant" | other), a `message` (role + content, following
 the Anthropic Messages API shape), and a `timestamp`. A "turn" starts at each real user
 prompt (a user message that isn't purely a tool_result wrapper) and runs until the next
 one. Unrecognized/malformed lines are skipped and counted, not fatal.
+
+`parse_jsonl` / `build_figure` / `show_event_dialog` are lifted unchanged from the old
+Session Timeline page; `compute_log_metrics` is new and feeds the admin's per-participant
+view and the cross-condition statistics.
 """
 
 import json
+import statistics
 import string
 from datetime import datetime, timedelta, timezone
 
@@ -24,6 +28,10 @@ COLOR_AGENT = "#1baf7a"   # categorical slot 2 (aqua)
 COLOR_TOOL = "#eda100"    # categorical slot 3 (yellow)
 COLOR_MUTED = "#898781"   # muted ink (connector guide lines)
 COLOR_RING = "#fcfcfb"    # light chart surface, used as the marker ring
+
+# Tools that mutate a file — the count of these is the participant's "edit"/iteration
+# volume in the cohort stats.
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 # Distinct Plotly marker symbols, assigned in order to whatever tool names actually
 # appear in the uploaded session (so the legend adapts to the real data instead of
@@ -153,27 +161,19 @@ def parse_jsonl(raw_text: str) -> dict:
 
     Returns a dict with:
       - "events": list of event dicts, each carrying at least
-        {"idx", "turn", "lane", "t", "label", "record"}, plus lane-specific fields
-        (see below).
+        {"idx", "turn", "lane", "t", "label", "record"}, plus lane-specific fields.
       - "skipped": count of lines that were malformed JSON or an unrecognized shape.
       - "t0": epoch seconds of the first usable event (for relative-time display).
-
-    Every event also carries a "y_offset": a small vertical nudge (computed after
-    parsing) that spreads out events sharing a turn+lane and a near-identical
-    timestamp, so a burst of simultaneous tool calls doesn't render as one blob.
 
     Event fields by lane:
       User Prompt : "text", "classification" ("Chat" | "Instruct")
       Agent Call  : "text", "usage" (dict of token counts, may be empty)
       Tool Call   : "tool_name", "input" (dict), "result_text", "usage" (tokens of
-                    the parent Agent Call that invoked this tool -- a tool call has
-                    no token cost of its own in the Anthropic API)
+                    the parent Agent Call that invoked this tool)
     """
     events: list[dict] = []
     skipped = 0
     turn_no = 0
-    # tool_use_id -> index into `events` of the pending Tool Call event, so a later
-    # tool_result line can attach its output text.
     pending_tool_events: dict[str, int] = {}
 
     for line in raw_text.splitlines():
@@ -204,7 +204,6 @@ def parse_jsonl(raw_text: str) -> dict:
             continue
 
         if turn_no == 0:
-            # Nothing has started a turn yet (e.g. a leading system/meta record).
             skipped += 1
             continue
 
@@ -244,11 +243,8 @@ def parse_jsonl(raw_text: str) -> dict:
                     )
             continue
 
-        # Unrecognized record type (system/summary/meta/etc.) -- not plotted.
         skipped += 1
 
-    # Rule 4: a turn that actually invoked a tool is Instruct, regardless of how its
-    # opening prompt was phrased -- tool usage is a stronger signal than wording.
     turns_with_tools = {e["turn"] for e in events if e["lane"] == "Tool Call"}
     for e in events:
         if e["lane"] == "User Prompt" and e["turn"] in turns_with_tools:
@@ -260,6 +256,65 @@ def parse_jsonl(raw_text: str) -> dict:
     return {"events": events, "skipped": skipped, "t0": t0}
 
 
+# --- Derived metrics ------------------------------------------------------------
+
+def compute_log_metrics(parsed: dict) -> dict:
+    """Reduce a parsed session into the scalar behavioural metrics the admin views
+    use. Safe on an empty/degenerate session: every field is present, zeros/None
+    where undefined.
+
+    Manipulation-check metrics:
+      time_to_first_tool_call_s — planning time before the agent first acted;
+        expected highest under the "slow planning" condition.
+      median_inter_tool_gap_s   — typical pause between successive tool calls;
+        expected highest under the "slow iterating" condition.
+    """
+    events = parsed.get("events", [])
+    t0 = parsed.get("t0")
+
+    prompts = [e for e in events if e["lane"] == "User Prompt"]
+    agents = [e for e in events if e["lane"] == "Agent Call"]
+    tools = sorted((e for e in events if e["lane"] == "Tool Call"), key=lambda e: e["t"])
+
+    tool_counts: dict[str, int] = {}
+    for e in tools:
+        tool_counts[e["tool_name"]] = tool_counts.get(e["tool_name"], 0) + 1
+
+    tool_times = [e["t"] for e in tools]
+    inter_gaps = [b - a for a, b in zip(tool_times, tool_times[1:])] if len(tool_times) > 1 else []
+
+    all_times = [e["t"] for e in events]
+    duration = (max(all_times) - min(all_times)) if all_times else 0.0
+
+    time_to_first_tool = None
+    if tool_times and t0 is not None:
+        first_prompt_t = min((p["t"] for p in prompts), default=t0)
+        time_to_first_tool = round(tool_times[0] - first_prompt_t, 1)
+
+    tokens_in = sum((a["usage"] or {}).get("input_tokens", 0) or 0 for a in agents)
+    tokens_out = sum((a["usage"] or {}).get("output_tokens", 0) or 0 for a in agents)
+    cache_read = sum((a["usage"] or {}).get("cache_read_input_tokens", 0) or 0 for a in agents)
+
+    return {
+        "session_duration_s": round(duration, 1),
+        "n_turns": len({e["turn"] for e in events}),
+        "n_user_prompts": len(prompts),
+        "n_agent_calls": len(agents),
+        "n_tool_calls": len(tools),
+        "n_edits": sum(v for k, v in tool_counts.items() if k in EDIT_TOOLS),
+        "tool_counts": tool_counts,
+        "time_to_first_tool_call_s": time_to_first_tool,
+        "median_inter_tool_gap_s": round(statistics.median(inter_gaps), 1) if inter_gaps else None,
+        "mean_inter_tool_gap_s": round(statistics.fmean(inter_gaps), 1) if inter_gaps else None,
+        "chat_count": sum(1 for p in prompts if p["classification"] == "Chat"),
+        "instruct_count": sum(1 for p in prompts if p["classification"] == "Instruct"),
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cache_read_tokens": cache_read,
+        "skipped_lines": parsed.get("skipped", 0),
+    }
+
+
 # --- Charting -----------------------------------------------------------------
 
 def build_figure(parsed: dict) -> go.Figure:
@@ -267,13 +322,10 @@ def build_figure(parsed: dict) -> go.Figure:
     t0 = parsed["t0"] or 0.0
 
     def rel(t: float) -> datetime:
-        # Encode relative-seconds-since-session-start as a fake datetime so Plotly's
-        # date axis gives us free, readable HH:MM:SS tick formatting.
         return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=t - t0)
 
     fig = go.Figure()
 
-    # Dotted vertical guide connecting the three lanes at each turn's start time.
     turns = sorted({e["turn"] for e in events})
     guide_x, guide_y, turn_x, turn_text = [], [], [], []
     for turn in turns:
@@ -301,7 +353,6 @@ def build_figure(parsed: dict) -> go.Figure:
     def y_of(e: dict) -> float:
         return LANE_Y[e["lane"]] + e.get("y_offset", 0.0)
 
-    # Agent Call: one trace, single symbol (no sub-classification requested for it).
     agent_events = [e for e in events if e["lane"] == "Agent Call"]
     fig.add_trace(go.Scatter(
         x=[rel(e["t"]) for e in agent_events], y=[y_of(e) for e in agent_events],
@@ -313,7 +364,6 @@ def build_figure(parsed: dict) -> go.Figure:
         hoverinfo="text",
     ))
 
-    # User Prompt: split into Chat / Instruct, same hue, different symbol.
     for kind in ("Instruct", "Chat"):
         sub = [e for e in events if e["lane"] == "User Prompt" and e["classification"] == kind]
         fig.add_trace(go.Scatter(
@@ -326,8 +376,6 @@ def build_figure(parsed: dict) -> go.Figure:
             hoverinfo="text",
         ))
 
-    # Tool Call: one trace per distinct tool name, same hue, different symbol -- the
-    # symbol assignment adapts to whatever tools actually appear in this session.
     tool_events = [e for e in events if e["lane"] == "Tool Call"]
     tool_names = sorted({e["tool_name"] for e in tool_events})
     symbol_for_tool = {
@@ -420,42 +468,26 @@ def show_event_dialog(event: dict, t0: float):
         st.json(event["record"])
 
 
-# --- Page -------------------------------------------------------------------------
-
-st.title("🧭 Session Timeline")
-st.caption(
-    "Each lane is one action type; x-axis is relative session time. Dotted lines "
-    "connect events within a turn. **Click any marker** for its content, timestamp, "
-    "and token usage."
-)
-
-uploaded = st.file_uploader("Claude Code session (.jsonl)", type=["jsonl"])
-
-if uploaded is not None:
-    raw_text = uploaded.getvalue().decode("utf-8", errors="replace")
-    parsed = parse_jsonl(raw_text)
-
+def render_timeline(raw_jsonl: str, key: str) -> None:
+    """Render the swimlane chart for one session with click-to-open detail popups.
+    `key` must be unique per participant so Streamlit keeps the charts distinct.
+    """
+    parsed = parse_jsonl(raw_jsonl)
     if not parsed["events"]:
-        st.error(
-            "No recognizable turns were found in this file. It may not match the "
-            "expected Claude Code session JSONL format."
-        )
-    else:
-        if parsed["skipped"]:
-            st.caption(f"Skipped {parsed['skipped']} unparseable/unrecognized line(s).")
+        st.info("No recognizable turns in this session log.")
+        return
+    if parsed["skipped"]:
+        st.caption(f"Skipped {parsed['skipped']} unparseable/unrecognized line(s).")
 
-        fig = build_figure(parsed)
-        event_state = st.plotly_chart(
-            fig, on_select="rerun", selection_mode="points",
-            key="timeline_chart", width="stretch",
-        )
-
-        points = (event_state or {}).get("selection", {}).get("points", [])
-        if points:
-            clicked_idx = points[0].get("customdata")
-            if clicked_idx is not None and clicked_idx != st.session_state.get("_last_shown_event"):
-                st.session_state["_last_shown_event"] = clicked_idx
-                clicked_event = next(e for e in parsed["events"] if e["idx"] == clicked_idx)
-                show_event_dialog(clicked_event, parsed["t0"])
-else:
-    st.info("Upload a Claude Code session `.jsonl` file to visualize it.")
+    event_state = st.plotly_chart(
+        build_figure(parsed), on_select="rerun", selection_mode="points",
+        key=f"timeline_{key}", width="stretch",
+    )
+    points = (event_state or {}).get("selection", {}).get("points", [])
+    if points:
+        clicked_idx = points[0].get("customdata")
+        shown_key = f"_last_shown_event_{key}"
+        if clicked_idx is not None and clicked_idx != st.session_state.get(shown_key):
+            st.session_state[shown_key] = clicked_idx
+            clicked_event = next(e for e in parsed["events"] if e["idx"] == clicked_idx)
+            show_event_dialog(clicked_event, parsed["t0"])

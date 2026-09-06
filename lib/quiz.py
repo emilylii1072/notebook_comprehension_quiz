@@ -1,43 +1,32 @@
-"""Notebook Quiz — a comprehension quiz generated from an uploaded Jupyter notebook.
+"""Notebook comprehension quiz — generation, blind self-check, and dynamic follow-ups.
 
-A candidate uploads the attrition-model notebook they submitted; the model generates
-a quiz grounded in that specific notebook (some questions are dynamic follow-ups
-generated from the candidate's own live answer); the candidate answers one question
-at a time while a stopwatch (not a countdown — there is no time limit) tracks
-elapsed time; correct answers are never revealed until the final question breakdown.
+A quiz is generated from a specific uploaded notebook (some questions are dynamic
+follow-ups generated from the participant's own live answer). Quiz generation runs on
+Claude Opus 5; every LLM-authored question is then *self-checked* — the model takes the
+freshly written quiz blind (options only, no answer key) and reports which options are
+defensibly correct. Any question that doesn't have exactly one defensible answer — its
+own designated one — is sent back for a minimal repair, then re-checked. See
+verify_quiz().
 
-Quiz generation runs on Claude Opus 5 (Anthropic). Every LLM-authored question is
-then *self-checked*: the model takes the freshly written quiz blind (options only,
-no answer key) and reports which options are defensibly correct. Any question that
-doesn't have exactly one defensible answer — its own designated one — is sent back
-for a minimal repair (usually just rewording an over-correct distractor), then
-re-checked. See verify_quiz().
-
-One page of the multipage app — run the app via `streamlit run app.py`.
+This module holds only the generation/verification logic (no Streamlit UI). The
+in-app quiz-taking flow lives in lib/quiz_ui.py.
 Auth: set ANTHROPIC_API_KEY (e.g. in a local .env file).
 """
 
 import json
 import random
-import time
 
 import anthropic
-import nbformat
 import streamlit as st
 from anthropic import Anthropic
-from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 
-from db import get_model_followup, save_model_followup, save_quiz_result
-
-load_dotenv()
+from db import get_model_followup, save_model_followup
 
 MODEL = "claude-opus-5"  # swap to "claude-sonnet-5" for cheaper/faster test iteration
-MAX_OUTPUT_CHARS_PER_CELL = 1500
 
 # How many repair→re-check rounds a flagged question gets before we give up and
-# just record a warning. Each round is one "take the quiz" call plus (if anything
-# is still flagged) one batched repair call.
+# just record a warning.
 VERIFY_ROUNDS = 2
 
 TASK_CONTEXT = """\
@@ -63,19 +52,12 @@ discussion of production considerations."
 """
 
 # The four models a candidate can be asked about. Fixed rather than LLM-invented so
-# the model_followup question bank (below) has a small, known key space.
+# the model_followup question bank has a small, known key space.
 FIXED_MODEL_OPTIONS = ["Random Forest", "XGBoost", "Logistic Regression", "Support Vector Machine"]
 
-# Slots whose option SET is fixed (only correct_index may move during a repair):
-# model_choice's four options are the fixed list above; io_overlap is Yes/No.
+# Slots whose option SET is fixed (only correct_index may move during a repair).
 FIXED_OPTION_SLOTS = {"model_choice", "io_overlap"}
 
-# The 8 questions generated together in one batch call (generate_quiz). num_employees,
-# row_granularity, label_exists, and io_overlap_ok are separate, fixed (non-LLM)
-# questions inserted at specific points in the sequence -- see build_items() below.
-# model_followup and label_followup are dynamic follow-ups, materialized live during
-# the quiz; see FOLLOWUP_AFTER / FOLLOWUP_SUBJECT_FOR_TRIGGER. This is the complete
-# LLM-generated question set -- there are no other LLM slots.
 SLOT_ORDER = [
     "aggregation",
     "train_test_split",
@@ -88,7 +70,7 @@ SLOT_ORDER = [
 ]
 
 # Where dynamic follow-ups are inserted relative to their trigger slot, and what
-# "subject" the materialization logic should treat them as (see the quiz stage).
+# "subject" the materialization logic should treat them as.
 FOLLOWUP_AFTER = {
     "label_exists": "label_followup",
     "model_choice": "model_followup",
@@ -230,10 +212,6 @@ SYSTEM_PROMPT = (
     + TASK_CONTEXT
 )
 
-# Style exemplars for generate_model_followup: every option (correct AND
-# distractors) shares similar structural/keyword framing, so the correct answer
-# isn't identifiable just by noticing which option mentions the model's own
-# characteristic keywords or is a different length/shape than the others.
 MODEL_FOLLOWUP_FEWSHOT = """\
 Style examples (the [correct] tag marks the right answer -- note every option, \
 right or wrong, shares comparable structure and technical detail):
@@ -273,10 +251,9 @@ class QuestionVerdict(BaseModel):
     """One entry from a blind "take the quiz" pass."""
 
     slot: str
-    defensible_option_indices: list[int]  # 0-based; every option a knowledgeable
-    #                                       reader could defend as correct
+    defensible_option_indices: list[int]
     well_formed: bool
-    issue: str  # one sentence describing the problem, or "" if well_formed
+    issue: str
 
 
 class QuizVerification(BaseModel):
@@ -284,35 +261,8 @@ class QuizVerification(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Notebook parsing
+# Notebook wrapping for the prompt
 # ---------------------------------------------------------------------------
-
-def notebook_to_text(raw: bytes) -> str:
-    """Flatten a .ipynb into a text transcript of markdown, code, and outputs."""
-    nb = nbformat.reads(raw.decode("utf-8"), as_version=4)
-    parts = []
-    for i, cell in enumerate(nb.cells):
-        if cell.cell_type == "markdown":
-            parts.append(f"--- markdown cell {i} ---\n{cell.source}")
-        elif cell.cell_type == "code":
-            parts.append(f"--- code cell {i} ---\n{cell.source}")
-            out_texts = []
-            for out in cell.get("outputs", []):
-                text = ""
-                if out.get("output_type") == "stream":
-                    text = "".join(out.get("text", ""))
-                elif out.get("output_type") in ("execute_result", "display_data"):
-                    text = "".join(out.get("data", {}).get("text/plain", ""))
-                elif out.get("output_type") == "error":
-                    text = "\n".join(out.get("traceback", []))
-                if text:
-                    if len(text) > MAX_OUTPUT_CHARS_PER_CELL:
-                        text = text[:MAX_OUTPUT_CHARS_PER_CELL] + "\n[output truncated]"
-                    out_texts.append(text)
-            if out_texts:
-                parts.append(f"--- output of cell {i} ---\n" + "\n".join(out_texts))
-    return "\n\n".join(parts)
-
 
 def notebook_prompt_prefix(notebook_text: str) -> str:
     """The notebook wrapped for the prompt. Every model call leads with this exact
@@ -324,8 +274,7 @@ def notebook_prompt_prefix(notebook_text: str) -> str:
 
 def _reshuffle(q: QuizQuestion) -> None:
     """Shuffle a question's options in place, keeping correct_index pointing at the
-    same option text. Used for slots with a fixed/partially-fixed option set, so the
-    final order never depends on whatever order the LLM happened to emit."""
+    same option text."""
     correct_text = q.options[q.correct_index]
     order = list(range(len(q.options)))
     random.shuffle(order)
@@ -334,9 +283,8 @@ def _reshuffle(q: QuizQuestion) -> None:
 
 
 def label_exists_question() -> QuizQuestion:
-    """A fixed, non-LLM question. The task's starter dataset (pq_data) is
-    deliberately missing the attrition label for every candidate, so the correct
-    answer never depends on the notebook's content -- no API call needed."""
+    """A fixed, non-LLM question. pq_data is deliberately missing the attrition label
+    for every candidate, so the correct answer never depends on the notebook."""
     return QuizQuestion(
         slot="label_exists",
         topic="missing label",
@@ -352,9 +300,7 @@ def label_exists_question() -> QuizQuestion:
 
 
 def num_employees_question() -> QuizQuestion:
-    """A fixed, non-LLM question. pq_data always has the same 300 unique PersonId
-    values for every candidate, so the correct answer never depends on the
-    notebook's content -- no API call needed."""
+    """A fixed, non-LLM question. pq_data always has 300 unique PersonId values."""
     q = QuizQuestion(
         slot="num_employees",
         topic="dataset size",
@@ -371,8 +317,7 @@ def num_employees_question() -> QuizQuestion:
 
 
 def row_granularity_question() -> QuizQuestion:
-    """A fixed, non-LLM question about pq_data's row grain, which is identical for
-    every candidate -- no API call needed."""
+    """A fixed, non-LLM question about pq_data's row grain."""
     q = QuizQuestion(
         slot="row_granularity",
         topic="row granularity",
@@ -398,8 +343,7 @@ def row_granularity_question() -> QuizQuestion:
 
 
 def io_overlap_ok_question() -> QuizQuestion:
-    """A fixed, non-LLM question testing general ML knowledge (data leakage) rather
-    than anything specific to this notebook -- no API call needed."""
+    """A fixed, non-LLM question testing general ML knowledge (data leakage)."""
     return QuizQuestion(
         slot="io_overlap_ok",
         topic="data leakage",
@@ -446,6 +390,10 @@ def _parse_call(
         response = client.messages.parse(
             model=MODEL,
             max_tokens=max_tokens,
+            # Explicit timeout: without it the SDK refuses a non-streaming call whose
+            # max_tokens *could* run >10 min. These calls take well under that; 10 min
+            # is a safe ceiling.
+            timeout=600.0,
             system=[{
                 "type": "text",
                 "text": SYSTEM_PROMPT,
@@ -465,7 +413,6 @@ def _parse_call(
             output_format=schema,
         )
     except ValidationError as e:
-        # The model's text didn't match the schema — usually a truncated response.
         raise RuntimeError(f"The model returned a malformed response: {e} — try again.") from e
 
     if response.stop_reason == "refusal":
@@ -518,8 +465,6 @@ def generate_quiz(client: Anthropic, notebook_text: str) -> list[QuizQuestion]:
             "try again."
         )
 
-    # Python-side reshuffle guarantees true randomization for the fixed-option
-    # slots, regardless of what order the LLM happened to emit them in.
     for q in deduped:
         if q.slot in FIXED_OPTION_SLOTS:
             _reshuffle(q)
@@ -528,8 +473,7 @@ def generate_quiz(client: Anthropic, notebook_text: str) -> list[QuizQuestion]:
 
 
 # ---------------------------------------------------------------------------
-# Self-check: the model takes the quiz it just wrote, blind, and we repair any
-# question that doesn't have exactly one defensible answer.
+# Self-check
 # ---------------------------------------------------------------------------
 
 TAKE_QUIZ_INSTRUCTIONS = """\
@@ -610,8 +554,7 @@ def _repair_questions(
     notebook_text: str,
     flagged: list[tuple[QuizQuestion, QuestionVerdict]],
 ) -> dict[str, QuizQuestion]:
-    """Regenerate the flagged questions so each has exactly one correct option.
-    Keyed by slot."""
+    """Regenerate the flagged questions so each has exactly one correct option."""
     payload = json.dumps(
         [
             {
@@ -636,7 +579,7 @@ def _repair_questions(
 
 def _accept_repair(original: QuizQuestion, repaired: QuizQuestion) -> QuizQuestion | None:
     """Return the repaired question only if it still satisfies this slot's
-    structural constraints; otherwise None, so the caller keeps the original."""
+    structural constraints; otherwise None."""
     n = len(original.options)
     if len(repaired.options) != n or not (0 <= repaired.correct_index < n):
         return None
@@ -656,9 +599,8 @@ def verify_quiz(
     rounds: int = VERIFY_ROUNDS,
 ) -> tuple[list[QuizQuestion], list[str]]:
     """Take the quiz blind and repair any question that doesn't have exactly one
-    defensible answer (its own designated one). Returns the (possibly repaired)
-    questions and a list of human-readable warnings for questions that couldn't be
-    made single-answer within `rounds` repair attempts."""
+    defensible answer. Returns the (possibly repaired) questions and a list of
+    human-readable warnings for questions that couldn't be made single-answer."""
     questions = list(questions)
     idx_by_slot = {q.slot: i for i, q in enumerate(questions)}
     pending = list(range(len(questions)))
@@ -674,10 +616,10 @@ def verify_quiz(
             q = questions[i]
             v = verdicts.get(q.slot)
             if v is None:
-                continue  # model didn't return this slot — leave the question as-is
+                continue
             defensible = {d for d in v.defensible_option_indices if 0 <= d < len(q.options)}
             if v.well_formed and defensible == {q.correct_index}:
-                continue  # clean
+                continue
             if attempt == rounds:
                 warnings.append(
                     f"{q.slot}: {v.issue or 'the self-check did not converge on a single correct answer'}"
@@ -853,295 +795,3 @@ def call_with_errors_surfaced(fn, *args, **kwargs):
     except RuntimeError as e:
         st.error(str(e))
     return None
-
-
-# ---------------------------------------------------------------------------
-# Streamlit app
-# ---------------------------------------------------------------------------
-
-if "stage" not in st.session_state:
-    st.session_state.stage = "upload"
-
-
-def reset():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.session_state.stage = "upload"
-
-
-@st.cache_resource
-def get_client() -> Anthropic:
-    return Anthropic()
-
-
-def build_items(static_questions: list[QuizQuestion]) -> list:
-    """Interleave the static questions with follow-up placeholders, producing the
-    full quiz sequence in template order."""
-    items = []
-    for q in static_questions:
-        items.append(q)
-        if q.slot in FOLLOWUP_AFTER:
-            items.append({"placeholder": True, "subject": FOLLOWUP_SUBJECT_FOR_TRIGGER[q.slot]})
-    return items
-
-
-def _skipped_question(slot: str, reason: str) -> QuizQuestion:
-    """A trivial placeholder for a follow-up that won't be generated (either the
-    trigger's premise didn't hold, or generation failed and the candidate chose to
-    skip). Excluded from scoring via the `topic == "skipped"` check in finish_quiz."""
-    return QuizQuestion(
-        slot=slot, topic="skipped",
-        question=f"_({reason})_",
-        options=["N/A", "N/A", "N/A", "N/A"], correct_index=0,
-        explanation=reason,
-    )
-
-
-def record_current_answer():
-    """Save the radio selection (and elapsed time) for the current question index."""
-    idx = st.session_state.current_index
-    item = st.session_state.quiz_items[idx]
-    # Streamlit re-executes the whole script (including class definitions) on every
-    # rerun, so a QuizQuestion instance stored in session_state from an earlier rerun
-    # is never `isinstance` of *this* rerun's freshly-defined QuizQuestion class.
-    # Check against the stable builtin `dict` (the placeholder marker) instead.
-    if not isinstance(item, dict):
-        selected = st.session_state.get(f"q{idx}")
-        st.session_state.answers[idx] = (
-            item.options.index(selected) if selected in item.options else None
-        )
-        started = st.session_state.question_start_times.get(idx, time.time())
-        st.session_state.time_spent[idx] = round(time.time() - started, 1)
-
-
-def finish_quiz():
-    """Collect only materialized questions (drops any never-reached follow-up
-    placeholder, and any question explicitly marked as skipped)."""
-    final_q, final_a, final_t = [], [], []
-    for it, a, t in zip(
-        st.session_state.quiz_items, st.session_state.answers, st.session_state.time_spent
-    ):
-        if not isinstance(it, dict) and it.topic != "skipped":
-            final_q.append(it)
-            final_a.append(a)
-            final_t.append(t)
-    st.session_state.final_questions = final_q
-    st.session_state.final_answers = final_a
-    st.session_state.final_time_spent = final_t
-    st.session_state.elapsed = time.time() - st.session_state.started_at
-    st.session_state.stage = "results"
-
-
-st.title("📝 Notebook Comprehension Quiz")
-
-# ---- Stage: upload -------------------------------------------------------
-if st.session_state.stage == "upload":
-    st.markdown(
-        "Upload the Jupyter notebook you submitted for the **employee attrition "
-        "model** task. A quiz (some questions generated live from your own answers) "
-        "will check your understanding of your own submission. A stopwatch tracks "
-        "how long you take, but there's no time limit."
-    )
-
-    candidate_name = st.text_input("Candidate name (optional, stored with your results)")
-    uploaded = st.file_uploader("Notebook (.ipynb)", type=["ipynb"])
-
-    if uploaded is not None and st.button("Generate quiz", type="primary"):
-        try:
-            notebook_text = notebook_to_text(uploaded.getvalue())
-        except Exception as e:
-            st.error(f"Could not parse the notebook: {e}")
-            st.stop()
-        if not notebook_text.strip():
-            st.error("The notebook appears to be empty.")
-            st.stop()
-
-        with st.spinner(
-            "Reading the notebook, writing questions, and self-checking each one… "
-            "(~2 minutes)"
-        ):
-            static_questions = call_with_errors_surfaced(
-                assemble_static_questions, get_client(), notebook_text
-            )
-        if static_questions is not None:
-            items = build_items(static_questions)
-            st.session_state.quiz_items = items
-            st.session_state.answers = [None] * len(items)
-            st.session_state.time_spent = [None] * len(items)
-            st.session_state.question_start_times = {}
-            st.session_state.notebook_text = notebook_text
-            st.session_state.candidate_name = candidate_name.strip() or None
-            st.session_state.notebook_filename = uploaded.name
-            st.session_state.current_index = 0
-            st.session_state.started_at = time.time()
-            st.session_state.stage = "quiz"
-            st.rerun()
-
-# ---- Stage: quiz ---------------------------------------------------------
-elif st.session_state.stage == "quiz":
-    idx = st.session_state.current_index
-
-    item = st.session_state.quiz_items[idx]
-
-    # Materialize a follow-up placeholder based on the candidate's answer to the
-    # preceding trigger question, the first time we land on this index.
-    if isinstance(item, dict) and item.get("placeholder"):
-        subject = item["subject"]
-        trigger_item = st.session_state.quiz_items[idx - 1]
-        trigger_answer_idx = st.session_state.answers[idx - 1]
-        trigger_is_dict = isinstance(trigger_item, dict)
-        chosen_label = (
-            trigger_item.options[trigger_answer_idx]
-            if not trigger_is_dict and trigger_answer_idx is not None
-            else None
-        )
-
-        if subject == "label" and (
-            trigger_is_dict
-            or trigger_answer_idx is None
-            or trigger_answer_idx != trigger_item.correct_index
-        ):
-            # The follow-up's premise ("there is no label") only holds if the
-            # candidate correctly answered "No" -- otherwise asking it doesn't make
-            # sense, so skip it rather than generating a question on a false premise.
-            st.session_state.quiz_items[idx] = _skipped_question(
-                "label_followup",
-                'Skipped — only asked when the previous question is answered "No".',
-            )
-            item = st.session_state.quiz_items[idx]
-        else:
-            with st.spinner("Generating a follow-up based on your answer…"):
-                if subject == "label":
-                    followup = call_with_errors_surfaced(
-                        generate_label_followup, get_client(), st.session_state.notebook_text,
-                    )
-                else:  # "model"
-                    model_name = chosen_label or trigger_item.options[trigger_item.correct_index]
-                    followup = call_with_errors_surfaced(
-                        generate_model_followup, get_client(), st.session_state.notebook_text,
-                        model_name, chosen_label is not None,
-                    )
-            if followup is None:
-                col_a, col_b = st.columns(2)
-                if col_a.button("Retry"):
-                    st.rerun()
-                if col_b.button("Skip this question"):
-                    st.session_state.quiz_items[idx] = _skipped_question(
-                        f"{subject}_followup",
-                        "This follow-up could not be generated and was skipped.",
-                    )
-                    st.session_state.current_index += 1
-                    st.rerun()
-                st.stop()
-            st.session_state.quiz_items[idx] = followup
-            item = followup
-
-    if idx not in st.session_state.question_start_times:
-        st.session_state.question_start_times[idx] = time.time()
-
-    @st.fragment(run_every=1.0)
-    def stopwatch():
-        elapsed = time.time() - st.session_state.started_at
-        mm, ss = divmod(int(elapsed), 60)
-        st.metric("⏱️ Time elapsed", f"{mm}:{ss:02d}")
-
-    stopwatch()
-    st.divider()
-
-    st.subheader(f"Question {idx + 1} of {len(st.session_state.quiz_items)}")
-    st.markdown(item.question)
-    st.radio(
-        "Select one:",
-        item.options,
-        index=None,
-        key=f"q{idx}",
-        label_visibility="collapsed",
-    )
-
-    is_last = idx == len(st.session_state.quiz_items) - 1
-    if st.button("Submit answers" if is_last else "Next question", type="primary"):
-        record_current_answer()
-        if is_last:
-            finish_quiz()
-        else:
-            st.session_state.current_index += 1
-        st.rerun()
-
-# ---- Stage: results ------------------------------------------------------
-elif st.session_state.stage == "results":
-    questions = st.session_state.final_questions
-    answers = st.session_state.final_answers
-    time_spent = st.session_state.final_time_spent
-    score = sum(1 for q, a in zip(questions, answers) if a == q.correct_index)
-    total = len(questions)
-
-    col1, col2 = st.columns(2)
-    col1.metric("Score", f"{score} / {total}")
-    col2.metric("Time used", f"{st.session_state.elapsed:.0f}s")
-
-    st.markdown("## Question breakdown")
-    for i, (q, a, t) in enumerate(zip(questions, answers, time_spent)):
-        correct = a == q.correct_index
-        icon = "✅" if correct else ("⬜" if a is None else "❌")
-        with st.expander(f"{icon} Q{i + 1} · {q.topic}"):
-            st.markdown(q.question)
-            st.markdown(f"- **Your answer:** {q.options[a] if a is not None else '_unanswered_'}")
-            st.markdown(f"- **Correct answer:** {q.options[q.correct_index]}")
-            st.markdown(f"- **Why:** {q.explanation}")
-            st.markdown(f"- **Time spent:** {t:.0f}s" if t is not None else "- **Time spent:** _unknown_")
-
-    gen_warnings = st.session_state.get("generation_warnings") or []
-    if gen_warnings:
-        st.caption(
-            "⚠️ Self-check could not fully resolve "
-            f"{len(gen_warnings)} question(s): " + "; ".join(gen_warnings)
-        )
-
-    question_records = [
-        {
-            "slot": q.slot,
-            "topic": q.topic,
-            "question": q.question,
-            "options": q.options,
-            "correct_index": q.correct_index,
-            "candidate_answer_index": a,
-            "answered_correctly": a == q.correct_index,
-            "explanation": q.explanation,
-            "time_spent_seconds": t,
-        }
-        for q, a, t in zip(questions, answers, time_spent)
-    ]
-    results_payload = {
-        "score": score,
-        "total": total,
-        "elapsed_seconds": round(st.session_state.elapsed, 1),
-        "questions": question_records,
-        "generation_warnings": gen_warnings,
-    }
-
-    if "db_save_attempted" not in st.session_state:
-        st.session_state.db_save_attempted = True
-        db_payload = {
-            "candidate_name": st.session_state.get("candidate_name"),
-            "notebook_filename": st.session_state.get("notebook_filename"),
-            "score": score,
-            "total": total,
-            "elapsed_seconds": round(st.session_state.elapsed, 1),
-            "questions": question_records,
-        }
-        saved, db_error = save_quiz_result(db_payload)
-        st.session_state.db_save_ok = saved
-        st.session_state.db_save_error = db_error
-
-    if st.session_state.get("db_save_ok"):
-        st.caption("✅ Saved to database")
-    else:
-        st.caption(f"⚠️ Not saved to database: {st.session_state.get('db_save_error')}")
-
-    st.download_button(
-        "Download results (JSON)",
-        data=json.dumps(results_payload, indent=2),
-        file_name="quiz_results.json",
-        mime="application/json",
-    )
-    st.button("Start over", on_click=reset)

@@ -1,16 +1,20 @@
-"""Multipage entry point.
+"""Multipage entry point for the participant study platform.
 
 Run with: streamlit run app.py
+
+  Participant — the participant-facing intake: subject ID + condition, upload the
+                7 study files, take the comprehension quiz. No scores are shown.
+  Admin       — password-gated researcher view: per-participant review + cohort
+                statistics + grading controls.
 """
 
 import streamlit as st
 
-st.set_page_config(page_title="Dynamic Evaluation Tools", page_icon="🧰", layout="centered")
+st.set_page_config(page_title="Dynamic Evaluation Study", page_icon="🧪", layout="wide")
 
 page = st.navigation([
-    st.Page("app_pages/notebook_quiz.py", title="Notebook Quiz", icon=":material/quiz:"),
-    st.Page("app_pages/notebook_grader.py", title="Notebook Grader", icon=":material/grading:"),
-    st.Page("app_pages/session_timeline.py", title="Session Timeline", icon=":material/timeline:"),
+    st.Page("app_pages/participant.py", title="Participant", icon=":material/assignment:"),
+    st.Page("app_pages/admin.py", title="Admin", icon=":material/admin_panel_settings:"),
 ])
 
 page.run()
