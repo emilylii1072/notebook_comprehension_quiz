@@ -722,6 +722,45 @@ def list_participant_logs_raw() -> list[dict]:
         return []
 
 
+def list_notebook_section_scores() -> list[dict]:
+    """[{subject_id, condition, section, score, max_pts, pct}] — one row per
+    (participant, rubric section), for the notebook-assessment visualisations."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        conds = {
+            r["subject_id"]: r.get("condition")
+            for r in (client.table("participants")
+                      .select("subject_id,condition").execute().data or [])
+        }
+        nbs = (
+            client.table("participant_notebooks")
+            .select("subject_id,results").execute().data or []
+        )
+    except Exception:
+        return []
+    out = []
+    for nb in nbs:
+        by_sec: dict[str, list[float]] = {}
+        for it in nb.get("results") or []:
+            s = (it.get("section") or "General").strip() or "General"
+            sc, mx = float(it.get("score") or 0), float(it.get("max_pts") or 0)
+            got = by_sec.setdefault(s, [0.0, 0.0])
+            got[0] += sc
+            got[1] += mx
+        for s, (sc, mx) in by_sec.items():
+            out.append({
+                "subject_id": nb["subject_id"],
+                "condition": conds.get(nb["subject_id"]),
+                "section": s,
+                "score": round(sc, 2),
+                "max_pts": round(mx, 2),
+                "pct": round(100 * sc / mx, 1) if mx else None,
+            })
+    return out
+
+
 def list_graded_participant_notebooks() -> dict:
     """{subject_id: {"results", "total_score", "max_score"}} for every participant
     whose notebook has been graded. Shape matches build_report.records_from_graded."""
