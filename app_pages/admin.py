@@ -2,7 +2,8 @@
 
 Password-gated (set ADMIN_PASSWORD in secrets / .env). Four tabs:
   1. Overview      — one row per participant, filter by condition, CSV export
-  2. Participant   — the five docs, the graded notebook, the quiz, the session timeline
+  2. Participant   — the five docs, the graded notebook, the quiz, the verbal
+                     assessment transcript, the session timeline
   3. Cohort stats  — outcomes + behaviour overall and split by condition
   4. Grading       — the active rubric + "grade all pending"
 
@@ -22,12 +23,13 @@ from db import (
     list_participant_summaries,
     list_pending_grading,
     list_rubrics,
+    save_participant_transcript,
     save_rubric,
     set_participant_grading_error,
     supabase_status,
     update_participant_grading,
 )
-from lib import cohort, grading
+from lib import cohort, grading, transcript
 from lib.llm import get_client
 from lib.quiz_ui import render_quiz_breakdown
 from lib.timeline import compute_log_metrics, parse_jsonl, render_timeline
@@ -100,7 +102,7 @@ with tab_overview:
         show = view[[
             "subject_id", "condition", "status", "grading_status", "submitted_at",
             "notebook_pct", "quiz_score", "quiz_total", "session_duration_s",
-            "n_tool_calls", "n_edits",
+            "n_tool_calls", "n_edits", "has_transcript",
         ]].copy()
         show["condition"] = show["condition"].map(CONDITION_LABEL).fillna(show["condition"])
         show["notebook_pct"] = show["notebook_pct"].round(1)
@@ -171,6 +173,46 @@ with tab_detail:
             render_quiz_breakdown(bundle["quiz"])
         else:
             st.caption("No quiz result on file.")
+
+        st.markdown("### Verbal assessment")
+        tr = bundle["transcript"]
+        if tr:
+            pairs = tr.get("parsed") or []
+            for pr in pairs:
+                st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
+                st.markdown(pr.get("answer") or "_(no answer)_")
+            if not pairs:
+                st.caption("Uploaded but not parsed — use Re-parse below.")
+            with st.expander("Raw transcript"):
+                st.text(tr["raw_text"])
+            c_re, c_dl = st.columns(2)
+            if c_re.button("Re-parse", key="reparse_tr"):
+                with st.spinner("Parsing…"):
+                    parsed = transcript.call_with_errors_surfaced(
+                        transcript.parse_transcript, get_client(), tr["raw_text"]
+                    )
+                if parsed is not None:
+                    save_participant_transcript(sid, tr["filename"], tr["raw_text"], parsed)
+                    st.rerun()
+            c_dl.download_button(
+                f"⬇️ {tr['filename']}", data=tr["raw_text"], file_name=tr["filename"],
+                mime="text/plain", key="dl_tr",
+            )
+        else:
+            up = st.file_uploader(
+                "Verbal assessment transcript (.txt)", type=["txt"], key="tr_up"
+            )
+            if up is not None and st.button("Upload & parse", key="tr_parse", type="primary"):
+                raw = up.getvalue().decode("utf-8", errors="replace")
+                with st.spinner("Parsing the transcript…"):
+                    parsed = transcript.call_with_errors_surfaced(
+                        transcript.parse_transcript, get_client(), raw
+                    )
+                ok, err = save_participant_transcript(sid, up.name, raw, parsed)
+                if not ok:
+                    st.error(f"Could not save: {err}")
+                else:
+                    st.rerun()
 
         st.markdown("### Session timeline")
         log = bundle["log"]
