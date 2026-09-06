@@ -513,6 +513,25 @@ def save_participant_log(
         return False, str(e)
 
 
+def mark_participant_stage1_done(subject_id: str) -> tuple[bool, str | None]:
+    """Part 1 (notebook + quiz + grading) is done; Part 2 (docs + log) still owed.
+    No-op on a participant already marked complete."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        (
+            client.table("participants")
+            .update({"status": "quiz_done"})
+            .eq("subject_id", subject_id)
+            .neq("status", "complete")
+            .execute()
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def mark_participant_complete(
     subject_id: str, file_manifest: dict
 ) -> tuple[bool, str | None]:

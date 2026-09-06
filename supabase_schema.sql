@@ -123,7 +123,7 @@ alter table graded_notebooks enable row level security;
 create table if not exists participants (
   subject_id text primary key,
   condition text not null,          -- 'slow_planning' | 'slow_iterating' | 'control'
-  status text not null default 'in_progress',        -- 'in_progress' | 'complete'
+  status text not null default 'in_progress',        -- 'in_progress' (Part 1 unfinished) | 'quiz_done' (Part 1 done, Part 2 owed) | 'complete'
   grading_status text not null default 'pending',     -- 'pending' | 'done' | 'error'
   grading_error text,
   file_manifest jsonb,              -- {expected: [...], received: [...]}

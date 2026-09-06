@@ -19,7 +19,7 @@ The app opens at http://localhost:8501 with two pages:
 
 | Page | Who | What |
 |---|---|---|
-| **Participant** | study participants | enter subject ID + condition, upload the 7 study files, take the comprehension quiz. **No scores are ever shown.** |
+| **Participant** | study participants | Part 1: subject ID + condition, upload the notebook, take the quiz. Part 2 (later, same ID): upload the reflection files + session log. **No scores are ever shown.** |
 | **Admin** | the researcher (password-gated) | per-participant review, cohort statistics, grading controls |
 
 `app.py` is the `st.navigation` router. Page shells live in `app_pages/`; all the
@@ -31,26 +31,35 @@ is an optional CLI that renders a standalone HTML grading report.
 
 ## Participant flow (`app_pages/participant.py`)
 
-1. **Identify** — subject ID (`P` + 3 digits, e.g. `P001`) and the condition
-   assigned in person, typed as text and normalised to one of `slow_planning` /
-   `slow_iterating` / `control`. Re-using an existing subject ID prompts before
-   replacing the earlier submission.
-2. **Upload** — exactly **7 files**, each named `{subject_id}_<name>`:
-   - `Pxxx_task_plan.md`
-   - `Pxxx_debug_manual.md`, `Pxxx_debug_ai.md`
-   - `Pxxx_ideate_manual.md`, `Pxxx_ideate_ai.md`
-   - `Pxxx_notebook.ipynb`
-   - `Pxxx_claude_log.jsonl`
+A **two-part** flow, both parts keyed to the same subject ID (`P` + 3 digits, e.g.
+`P001`). The page routes on the participant's stored status when they enter their ID.
 
-   A file check lists ✅ found / ❌ missing / 🚫 unexpected; **Submit is blocked
-   until exactly those 7 correctly-named files are selected.** The five markdown
-   docs, the notebook transcript, and the raw session log (plus derived behaviour
-   metrics) are saved on submit.
-3. **Quiz** — the notebook-comprehension quiz (see below) runs in-app, bound to the
-   subject ID. The participant never sees a score or a breakdown.
+**Part 1 — right after the coding task:**
+
+1. **Identify** — enter the subject ID and the condition assigned in person (typed
+   as text, normalised to `slow_planning` / `slow_iterating` / `control`).
+2. **Notebook** — upload only `Pxxx_notebook.ipynb` (exact name required). The
+   transcript is stored.
+3. **Quiz** — the notebook-comprehension quiz (see below) runs in-app. The
+   participant never sees a score or breakdown.
 4. **Finalize** — the notebook is graded synchronously against the active rubric
-   behind a neutral spinner. Grading failures are recorded for the admin, never
-   shown to the participant. The page ends on "Submission received."
+   behind a neutral spinner; grading failures are recorded for the admin, never
+   shown. Status → `quiz_done`. The participant can go straight to Part 2 or leave.
+
+**Part 2 — any time later:**
+
+Re-enter the same subject ID → the page detects `quiz_done` and asks for the
+remaining **6 files**, each named `{subject_id}_<name>` exactly:
+
+- `Pxxx_task_plan.md`
+- `Pxxx_debug_manual.md`, `Pxxx_debug_ai.md`
+- `Pxxx_ideate_manual.md`, `Pxxx_ideate_ai.md`
+- `Pxxx_claude_log.jsonl`
+
+A file check lists ✅ found / ❌ missing / 🚫 unexpected; **Submit is blocked until
+exactly those 6 correctly-named files are selected.** The notebook is never
+re-uploaded. The five docs plus the raw session log (and its derived behaviour
+metrics) are saved, and status → `complete`.
 
 ## Comprehension quiz
 
