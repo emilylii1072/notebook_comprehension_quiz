@@ -171,6 +171,95 @@ def _by_condition_figure(df: pd.DataFrame, col: str, label: str) -> go.Figure | 
     return fig
 
 
+def _sec_label(section: str) -> str:
+    return section.replace("_", " ").strip().capitalize()
+
+
+def _section_order(rows: list[dict]) -> list[str]:
+    seen = []
+    for r in rows:
+        if r["section"] not in seen:
+            seen.append(r["section"])
+    return seen
+
+
+def render_notebook_by_section(section_rows: list[dict]) -> None:
+    """Cohort notebook assessment broken out by rubric section, split by condition
+    (each point is one participant's % of that section's max)."""
+    rows = [r for r in section_rows if r.get("pct") is not None and r.get("condition")]
+    if not rows:
+        st.caption("No graded notebooks with a condition yet.")
+        return
+    df = pd.DataFrame(rows)
+    df["section_label"] = df["section"].map(_sec_label)
+    df["condition_label"] = df["condition"].map(CONDITION_LABEL).fillna(df["condition"])
+    order = [_sec_label(s) for s in _section_order(rows)]
+    cond_order = [c for c in CONDITIONS if c in df["condition"].unique()]
+
+    fig = px.box(
+        df, x="section_label", y="pct", color="condition",
+        category_orders={"section_label": order, "condition": cond_order},
+        color_discrete_map=CONDITION_COLOR, points="all",
+        labels={"pct": "% of section max", "section_label": ""},
+        hover_data=["subject_id"],
+    )
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=20, b=10), boxmode="group",
+        legend=dict(title="", orientation="h", y=1.12),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    piv = (
+        df.groupby(["section_label", "condition_label"])["pct"].mean()
+        .round(1).unstack("condition_label")
+        .reindex(order)
+    )
+    st.dataframe(piv, width="stretch")
+
+
+def render_participant_notebook_sections(
+    nb_results: list[dict], section_rows: list[dict], subject_id: str
+) -> None:
+    """One participant's per-section notebook score vs. the cohort mean per section."""
+    by_sec: dict[str, list[float]] = {}
+    for it in nb_results or []:
+        s = (it.get("section") or "General").strip() or "General"
+        got = by_sec.setdefault(s, [0.0, 0.0])
+        got[0] += float(it.get("score") or 0)
+        got[1] += float(it.get("max_pts") or 0)
+    if not by_sec:
+        return
+    sections = list(by_sec)
+    mine = {s: (100 * sc / mx if mx else 0.0) for s, (sc, mx) in by_sec.items()}
+
+    cohort_pct: dict[str, list[float]] = {}
+    for r in section_rows:
+        if r.get("pct") is not None and r["subject_id"] != subject_id:
+            cohort_pct.setdefault(r["section"], []).append(r["pct"])
+    cohort_mean = {s: (sum(v) / len(v) if v else None) for s, v in cohort_pct.items()}
+
+    labels = [_sec_label(s) for s in sections]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels, y=[round(mine[s], 1) for s in sections],
+        name=subject_id, marker_color=CONDITION_COLOR["control"],
+    ))
+    cm = [cohort_mean.get(s) for s in sections]
+    if any(v is not None for v in cm):
+        fig.add_trace(go.Scatter(
+            x=labels, y=[round(v, 1) if v is not None else None for v in cm],
+            name="cohort mean", mode="markers",
+            marker=dict(symbol="diamond", size=12, color="#0b0b0b",
+                        line=dict(width=2, color="#fcfcfb")),
+        ))
+    fig.update_layout(
+        height=320, margin=dict(l=10, r=10, t=20, b=10),
+        yaxis=dict(title="% of section max", range=[0, 105]),
+        legend=dict(orientation="h", y=1.15),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 def _stats_table(df: pd.DataFrame, col: str) -> pd.DataFrame:
     rows = []
     for cond in CONDITIONS:
@@ -184,7 +273,7 @@ def _stats_table(df: pd.DataFrame, col: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def render_cohort(summaries: list[dict]) -> None:
+def render_cohort(summaries: list[dict], section_rows: list[dict] | None = None) -> None:
     df = build_cohort_df(summaries)
     if df.empty:
         st.info("No completed submissions yet.")
@@ -221,6 +310,12 @@ def render_cohort(summaries: list[dict]) -> None:
                     f"ANOVA F({aov['df_between']},{aov['df_within']}) = {aov['F']:.2f}, "
                     f"p = {aov['p']:.3f}, η² = {aov['eta_sq']:.2f}"
                 )
+
+    if section_rows:
+        st.markdown("### Notebook — by rubric section")
+        st.caption("Each point is one participant's score on that section, as % of "
+                   "the section's max.")
+        render_notebook_by_section(section_rows)
 
     st.markdown("### Behaviour")
     for col, label in BEHAVIOUR_METRICS:

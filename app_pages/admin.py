@@ -24,6 +24,7 @@ from db import (
     get_rubric,
     get_secret,
     list_graded_participant_notebooks,
+    list_notebook_section_scores,
     list_participant_logs_raw,
     list_participant_summaries,
     list_pending_grading,
@@ -95,6 +96,8 @@ tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
      "4 · Notebook report", "5 · Grading & rubric"]
 )
 
+_section_rows = list_notebook_section_scores()  # (participant, section) grades; used in tabs 2 & 3
+
 # ---- Tab 1: Overview ----------------------------------------------------
 with tab_overview:
     summaries = list_participant_summaries()
@@ -153,14 +156,18 @@ with tab_detail:
         st.markdown("### Notebook grade")
         nb = bundle["notebook"]
         if nb and nb.get("results"):
-            gdf = pd.DataFrame(nb["results"])[["section", "criterion", "score", "max_pts", "reasoning"]]
-            st.dataframe(gdf, hide_index=True, width="stretch")
             st.metric(
                 "Total",
                 f"{nb.get('total_score')} / {nb.get('max_score')}"
                 + (f"  ({100 * nb['total_score'] / nb['max_score']:.0f}%)"
                    if nb.get("max_score") else ""),
             )
+            cohort.render_participant_notebook_sections(nb["results"], _section_rows, sid)
+            with st.expander("Per-criterion detail"):
+                gdf = pd.DataFrame(nb["results"])[
+                    ["section", "criterion", "score", "max_pts", "reasoning"]
+                ]
+                st.dataframe(gdf, hide_index=True, width="stretch")
         elif nb:
             st.caption("Notebook stored but not graded yet.")
             if st.button("Grade now", key="grade_now_detail"):
@@ -262,7 +269,7 @@ with tab_detail:
 
 # ---- Tab 3: Cohort statistics ----------------------------------------
 with tab_cohort:
-    cohort.render_cohort(list_participant_summaries())
+    cohort.render_cohort(list_participant_summaries(), _section_rows)
 
 # ---- Tab 4: Notebook grading report --------------------------------
 with tab_report:
