@@ -702,6 +702,30 @@ def list_participant_summaries() -> list[dict]:
     return rows
 
 
+def list_graded_participant_notebooks() -> dict:
+    """{subject_id: {"results", "total_score", "max_score"}} for every participant
+    whose notebook has been graded. Shape matches build_report.records_from_graded."""
+    client = get_supabase_client()
+    if client is None:
+        return {}
+    try:
+        rows = (
+            client.table("participant_notebooks")
+            .select("subject_id,results,total_score,max_score")
+            .execute().data or []
+        )
+    except Exception:
+        return {}
+    return {
+        r["subject_id"]: {
+            "results": r["results"],
+            "total_score": r.get("total_score"),
+            "max_score": r.get("max_score"),
+        }
+        for r in rows if r.get("results")
+    }
+
+
 def list_pending_grading() -> list[dict]:
     """Participants whose notebook still needs grading (status pending/error).
     Returns [{"subject_id", "notebook_text", "filename"}]."""

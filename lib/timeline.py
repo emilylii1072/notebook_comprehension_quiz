@@ -468,26 +468,71 @@ def show_event_dialog(event: dict, t0: float):
         st.json(event["record"])
 
 
+def _events_dataframe(parsed: dict):
+    """A flat table of every parsed event — the always-available fallback view."""
+    import pandas as pd
+
+    t0 = parsed.get("t0") or 0.0
+    rows = []
+    for e in sorted(parsed["events"], key=lambda e: (e["t"], e["idx"])):
+        detail = e.get("text") or e.get("tool_name") or ""
+        rows.append({
+            "turn": e["turn"],
+            "session_time": _format_session_time(e["t"], t0),
+            "lane": e["lane"],
+            "label": e["label"],
+            "detail": _preview(detail, 160),
+        })
+    return pd.DataFrame(rows)
+
+
+def _extract_clicked_idx(points: list) -> int | None:
+    """Pull the event index out of a plotly selection point. `customdata` may come
+    back as the scalar we set or as a 1-element list, depending on the version."""
+    if not points:
+        return None
+    cd = points[0].get("customdata")
+    if isinstance(cd, (list, tuple)):
+        cd = cd[0] if cd else None
+    try:
+        return int(cd) if cd is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def render_timeline(raw_jsonl: str, key: str) -> None:
-    """Render the swimlane chart for one session with click-to-open detail popups.
-    `key` must be unique per participant so Streamlit keeps the charts distinct.
+    """Render the swimlane chart for one session with click-to-open detail popups,
+    plus an always-visible event table as a fallback. `key` must be unique per
+    participant so Streamlit keeps the charts distinct.
     """
     parsed = parse_jsonl(raw_jsonl)
     if not parsed["events"]:
-        st.info("No recognizable turns in this session log.")
+        st.warning(
+            f"No recognizable turns in this session log "
+            f"({parsed['skipped']} line(s) skipped). It may not be a Claude Code "
+            "`.jsonl` transcript, or it uses a newer format."
+        )
+        with st.expander("First lines of the file"):
+            st.code("\n".join(raw_jsonl.splitlines()[:8]) or "(empty)")
         return
     if parsed["skipped"]:
         st.caption(f"Skipped {parsed['skipped']} unparseable/unrecognized line(s).")
 
-    event_state = st.plotly_chart(
-        build_figure(parsed), on_select="rerun", selection_mode="points",
-        key=f"timeline_{key}", width="stretch",
-    )
-    points = (event_state or {}).get("selection", {}).get("points", [])
-    if points:
-        clicked_idx = points[0].get("customdata")
+    try:
+        event_state = st.plotly_chart(
+            build_figure(parsed), on_select="rerun", selection_mode="points",
+            key=f"timeline_{key}", width="stretch",
+        )
+        points = (event_state or {}).get("selection", {}).get("points", []) if event_state else []
+        clicked_idx = _extract_clicked_idx(points)
         shown_key = f"_last_shown_event_{key}"
         if clicked_idx is not None and clicked_idx != st.session_state.get(shown_key):
             st.session_state[shown_key] = clicked_idx
-            clicked_event = next(e for e in parsed["events"] if e["idx"] == clicked_idx)
-            show_event_dialog(clicked_event, parsed["t0"])
+            clicked_event = next((e for e in parsed["events"] if e["idx"] == clicked_idx), None)
+            if clicked_event is not None:
+                show_event_dialog(clicked_event, parsed["t0"])
+    except Exception as e:  # never let a chart quirk hide the data
+        st.caption(f"(Interactive chart unavailable: {type(e).__name__})")
+
+    with st.expander(f"Event table ({len(parsed['events'])} events)"):
+        st.dataframe(_events_dataframe(parsed), hide_index=True, width="stretch")
