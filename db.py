@@ -496,10 +496,24 @@ def save_participant_quiz(subject_id: str, payload: dict) -> tuple[bool, str | N
 def save_participant_log(
     subject_id: str, filename: str, raw_jsonl: str, metrics: dict
 ) -> tuple[bool, str | None]:
+    """Add or replace one of a participant's (possibly several) log files, keyed
+    by (subject_id, filename) — a new filename adds a log, the same filename
+    replaces just that one. If the raw content actually changed, any turn
+    annotations already saved against this exact file are cleared, since new
+    content makes their turn_index-keyed tags meaningless (same lesson as a
+    stale rubric/taxonomy: don't let old annotations silently linger against
+    replaced content). A pure re-parse (metrics recomputed, content unchanged —
+    e.g. after a parser fix) leaves existing annotations alone."""
     client = get_supabase_client()
     if client is None:
         return False, "Database not configured."
     try:
+        prior = (
+            client.table("participant_logs").select("raw_jsonl")
+            .eq("subject_id", subject_id).eq("filename", filename)
+            .limit(1).execute().data or []
+        )
+        content_changed = not prior or prior[0].get("raw_jsonl") != raw_jsonl
         client.table("participant_logs").upsert(
             {
                 "subject_id": subject_id,
@@ -507,11 +521,13 @@ def save_participant_log(
                 "raw_jsonl": raw_jsonl,
                 "metrics": metrics,
             },
-            on_conflict="subject_id",
+            on_conflict="subject_id,filename",
         ).execute()
-        return True, None
     except Exception as e:
         return False, str(e)
+    if content_changed:
+        delete_turn_annotations(subject_id, "log", filename)
+    return True, None
 
 
 def mark_participant_stage1_done(subject_id: str) -> tuple[bool, str | None]:
@@ -599,7 +615,7 @@ def get_participant_bundle(subject_id: str) -> dict:
     client = get_supabase_client()
     empty = {
         "participant": None, "files": [], "notebook": None, "quiz": None,
-        "log": None, "transcript": None,
+        "logs": [], "transcript": None,
     }
     if client is None:
         return empty
@@ -620,11 +636,11 @@ def get_participant_bundle(subject_id: str) -> dict:
             .eq("subject_id", subject_id).limit(1).execute().data or []
         )
         out["quiz"] = qz[0] if qz else None
-        lg = (
+        out["logs"] = sorted(
             client.table("participant_logs").select("*")
-            .eq("subject_id", subject_id).limit(1).execute().data or []
+            .eq("subject_id", subject_id).execute().data or [],
+            key=lambda r: r.get("parsed_at") or "",
         )
-        out["log"] = lg[0] if lg else None
         tr = (
             client.table("participant_transcripts").select("*")
             .eq("subject_id", subject_id).limit(1).execute().data or []
@@ -656,11 +672,10 @@ def list_participant_summaries() -> list[dict]:
             for r in (client.table("participant_quiz")
                       .select("subject_id,score,total,elapsed_seconds").execute().data or [])
         }
-        logs = {
-            r["subject_id"]: r
-            for r in (client.table("participant_logs")
-                      .select("subject_id,metrics").execute().data or [])
-        }
+        log_rows: dict[str, list[dict]] = {}
+        for r in (client.table("participant_logs")
+                  .select("subject_id,raw_jsonl").execute().data or []):
+            log_rows.setdefault(r["subject_id"], []).append(r)
         transcript_ids = {
             r["subject_id"]
             for r in (client.table("participant_transcripts")
@@ -669,12 +684,25 @@ def list_participant_summaries() -> list[dict]:
     except Exception:
         return []
 
+    # A participant can have several log files now; combine them the same way
+    # the admin's Session timeline does (one merged event stream, one metrics
+    # pass) rather than reading back each log's own stored `metrics` column --
+    # per-log scalars like a median gap can't be validly combined after the
+    # fact. This is an intentional exception to db.py's usual no-lib-imports
+    # rule: it's the same "recompute live" approach already used for a single
+    # log (see the Session timeline sub-tab), just extended to several.
+    from lib.timeline import compute_log_metrics, merge_parsed, parse_jsonl
+
     rows = []
     for p in parts:
         sid = p["subject_id"]
         nb = notebooks.get(sid) or {}
         qz = quizzes.get(sid) or {}
-        metrics = (logs.get(sid) or {}).get("metrics") or {}
+        my_logs = log_rows.get(sid) or []
+        metrics = (
+            compute_log_metrics(merge_parsed([parse_jsonl(r["raw_jsonl"]) for r in my_logs]))
+            if my_logs else {}
+        )
         total, mx = nb.get("total_score"), nb.get("max_score")
         rows.append(
             {
@@ -691,6 +719,7 @@ def list_participant_summaries() -> list[dict]:
                 "quiz_pct": (100 * qz["score"] / qz["total"])
                 if (qz.get("score") is not None and qz.get("total")) else None,
                 "log_format": metrics.get("format"),
+                "n_logs": len(my_logs),
                 "session_duration_s": metrics.get("session_duration_s"),
                 "n_tool_calls": metrics.get("n_tool_calls"),
                 "n_edits": metrics.get("n_edits"),
@@ -749,43 +778,72 @@ def list_participant_transcripts_raw() -> list[dict]:
     return rows
 
 
-def save_turn_annotations(
-    subject_id: str, source: str, annotations: list[dict], model: str
+def delete_turn_annotations(
+    subject_id: str, source: str, log_filename: str = ""
 ) -> tuple[bool, str | None]:
-    """Add these turn annotations for (subject_id, source) — callers only pass
-    turns that weren't already annotated (see annotate_turn_indexes / lib.annotate's
-    skip_turn_indexes), so this is an append, not a replace. Upserts on the
-    composite PK as a safety net against a duplicate call landing twice."""
+    """Remove turn annotations for (subject_id, source[, log_filename]) — use
+    after the underlying file (log/transcript) or its ground truth (notebook)
+    was replaced, since old turn_index-keyed annotations no longer correspond
+    to real content. `log_filename` is ignored (matches the default '') for
+    source='transcript', since there's only one transcript per participant."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        q = client.table("participant_turn_annotations").delete().eq(
+            "subject_id", subject_id
+        ).eq("source", source)
+        if source == "log":
+            q = q.eq("log_filename", log_filename)
+        q.execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def save_turn_annotations(
+    subject_id: str, source: str, annotations: list[dict], model: str, log_filename: str = ""
+) -> tuple[bool, str | None]:
+    """Add these turn annotations for (subject_id, source[, log_filename]) —
+    callers only pass turns that weren't already annotated (see
+    annotated_turn_indexes / lib.annotate's skip_turn_indexes), so this is an
+    append, not a replace. Upserts on the composite PK as a safety net against
+    a duplicate call landing twice. `log_filename` is ignored (stays '') for
+    source='transcript'."""
     client = get_supabase_client()
     if client is None:
         return False, "Database not configured."
     if not annotations:
         return True, None
+    lf = log_filename if source == "log" else ""
     try:
         client.table("participant_turn_annotations").upsert(
             [
-                {"subject_id": subject_id, "source": source, "model": model, **a}
+                {"subject_id": subject_id, "source": source, "log_filename": lf,
+                 "model": model, **a}
                 for a in annotations
             ],
-            on_conflict="subject_id,source,turn_index",
+            on_conflict="subject_id,source,log_filename,turn_index",
         ).execute()
         return True, None
     except Exception as e:
         return False, str(e)
 
 
-def annotated_turn_indexes(subject_id: str, source: str) -> set[int]:
-    """Which turn_index values already have an annotation for (subject_id, source)
-    — used to skip already-annotated turns on a re-run."""
+def annotated_turn_indexes(subject_id: str, source: str, log_filename: str = "") -> set[int]:
+    """Which turn_index values already have an annotation for (subject_id,
+    source[, log_filename]) — used to skip already-annotated turns on a re-run."""
     client = get_supabase_client()
     if client is None:
         return set()
     try:
-        rows = (
+        q = (
             client.table("participant_turn_annotations")
             .select("turn_index").eq("subject_id", subject_id).eq("source", source)
-            .execute().data or []
         )
+        if source == "log":
+            q = q.eq("log_filename", log_filename)
+        rows = q.execute().data or []
     except Exception:
         return set()
     return {r["turn_index"] for r in rows}

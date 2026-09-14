@@ -172,12 +172,15 @@ create table if not exists participant_quiz (
 
 alter table participant_quiz enable row level security;
 
+-- A participant can have more than one session-log file (e.g. separate work
+-- sessions) -- the key is (subject_id, filename), not subject_id alone.
 create table if not exists participant_logs (
-  subject_id text primary key references participants (subject_id) on delete cascade,
+  subject_id text not null references participants (subject_id) on delete cascade,
   filename text not null,
   raw_jsonl text not null,
-  metrics jsonb not null,            -- lib.timeline.compute_log_metrics() output
-  parsed_at timestamptz not null default now()
+  metrics jsonb not null,            -- lib.timeline.compute_log_metrics() output, this file only
+  parsed_at timestamptz not null default now(),
+  primary key (subject_id, filename)
 );
 
 alter table participant_logs enable row level security;
@@ -199,7 +202,12 @@ alter table participant_transcripts enable row level security;
 create table if not exists participant_turn_annotations (
   subject_id text not null references participants (subject_id) on delete cascade,
   source text not null,          -- 'log' | 'transcript'
-  turn_index int not null,       -- log: the event's `turn` field; transcript: pair list index
+  log_filename text not null default '',  -- source='log': which of the participant's
+                                  -- (possibly several) log files this turn is from.
+                                  -- '' for source='transcript' (only one per participant,
+                                  -- so no discriminator needed -- a PK column can't be NULL).
+  turn_index int not null,       -- log: the event's `turn` field (scoped to log_filename);
+                                  -- transcript: pair list index
   turn_text text not null,       -- snapshot of what was annotated, for audit/display
   phase text,                    -- source='log' only: planning | implementing | debugging | verifying | reflecting
   delegation_posture text,       -- source='log' only: high_level_ask | step_by_step | clarifying_question
@@ -209,7 +217,7 @@ create table if not exists participant_turn_annotations (
   reasoning text,                -- short model-written justification
   model text not null,
   created_at timestamptz not null default now(),
-  primary key (subject_id, source, turn_index)
+  primary key (subject_id, source, log_filename, turn_index)
 );
 
 create index if not exists participant_turn_annotations_subject_idx
@@ -261,6 +269,24 @@ end $$;
 -- (checking the participant's spoken answer against their own notebook) was split
 -- out from the log-behaviour taxonomy (phase/delegation_posture/trust_behavior).
 alter table participant_turn_annotations add column if not exists accuracy text;
+
+-- A participant can now have more than one session-log file, so subject_id
+-- alone can no longer be participant_logs' primary key, and turn_index alone
+-- can no longer be participant_turn_annotations' either (two log files could
+-- both have a "turn 1"). Safe on existing data: today every participant has
+-- at most one log, so the backfill below is exact, not a guess.
+alter table participant_logs drop constraint if exists participant_logs_pkey;
+alter table participant_logs add primary key (subject_id, filename);
+
+alter table participant_turn_annotations
+  add column if not exists log_filename text not null default '';
+update participant_turn_annotations t
+set log_filename = pl.filename
+from participant_logs pl
+where t.subject_id = pl.subject_id and t.source = 'log' and t.log_filename = '';
+alter table participant_turn_annotations drop constraint if exists participant_turn_annotations_pkey;
+alter table participant_turn_annotations
+  add primary key (subject_id, source, log_filename, turn_index);
 
 -- PostgREST caches the schema and answers from that cache; this makes the new
 -- column visible immediately instead of waiting for its own reload.

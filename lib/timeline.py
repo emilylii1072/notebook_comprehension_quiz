@@ -331,6 +331,44 @@ def parse_jsonl(raw_text: str) -> dict:
     return {"events": events, "skipped": skipped, "t0": t0, "format": "transcript"}
 
 
+def merge_parsed(parsed_list: list[dict]) -> dict:
+    """Combine several `parse_jsonl` results (e.g. a participant's multiple
+    session-log files) into one, so `compute_log_metrics` can run once over all
+    of them as if they were a single log. Same return shape as `parse_jsonl`.
+
+    `t` is an absolute epoch timestamp in every event (regardless of format), so
+    sorting the merged event list by `t` alone is chronologically correct across
+    files. `turn` numbers are NOT globally unique on their own, though (each
+    file numbers its own turns from 1) — offsetting them per file keeps
+    turn-count metrics (e.g. n_turns) accurate instead of undercounting from
+    turn-number collisions between files.
+    """
+    if not parsed_list:
+        return {"events": [], "skipped": 0, "t0": None, "format": "history"}
+    if len(parsed_list) == 1:
+        return parsed_list[0]
+
+    events: list[dict] = []
+    turn_offset = 0
+    for parsed in parsed_list:
+        these = parsed.get("events", [])
+        max_turn = max((e["turn"] for e in these), default=0)
+        for e in these:
+            events.append({**e, "turn": e["turn"] + turn_offset})
+        turn_offset += max_turn
+    events.sort(key=lambda e: e["t"])
+
+    skipped = sum(p.get("skipped", 0) for p in parsed_list)
+    t0_values = [p["t0"] for p in parsed_list if p.get("t0") is not None]
+    fmt = "transcript" if any(p.get("format") == "transcript" for p in parsed_list) else "history"
+    return {
+        "events": events,
+        "skipped": skipped,
+        "t0": min(t0_values) if t0_values else None,
+        "format": fmt,
+    }
+
+
 # --- Derived metrics ------------------------------------------------------------
 
 def _history_metrics(parsed: dict) -> dict:
