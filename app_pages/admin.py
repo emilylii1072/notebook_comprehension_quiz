@@ -30,6 +30,9 @@ from dotenv import load_dotenv
 from build_report import records_from_graded, render_report
 from db import (
     annotated_turn_indexes,
+    delete_participant_file,
+    delete_participant_log,
+    delete_participant_notebook,
     delete_turn_annotations,
     get_participant_bundle,
     get_rubric,
@@ -56,7 +59,12 @@ from lib import annotate, cohort, grading, transcript
 from lib.llm import get_client
 from lib.notebook import notebook_to_text
 from lib.quiz_ui import render_quiz_breakdown
-from lib.timeline import compute_log_metrics, merge_parsed, parse_jsonl, render_timeline
+from lib.timeline import (
+    compute_log_metrics,
+    merge_parsed,
+    parse_jsonl,
+    render_parsed_timeline,
+)
 
 load_dotenv()
 
@@ -113,11 +121,11 @@ def _grade_one(subject_id: str, notebook_text: str, rubric_name: str) -> tuple[b
     return (ok, "graded" if ok else (err or "save failed"))
 
 
-def _annotate_log_for(
-    subject_id: str, raw_jsonl: str, log_filename: str, force: bool = False
-) -> tuple[bool, str]:
-    """Tag every not-yet-annotated turn in one of a participant's session logs —
-    or, with force=True, every turn, overwriting whatever's already there."""
+def _annotate_log_core(
+    subject_id: str, raw_jsonl: str, log_filename: str, force: bool
+) -> tuple[bool, int, str | None]:
+    """Tag every not-yet-annotated turn in one session log (or every turn, with
+    force=True). Returns (ok, n_annotated, error)."""
     existing = (
         frozenset() if force
         else frozenset(annotated_turn_indexes(subject_id, "log", log_filename))
@@ -125,14 +133,44 @@ def _annotate_log_for(
     try:
         new_annos = annotate.annotate_log(get_client(), parse_jsonl(raw_jsonl), existing)
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, 0, f"{type(e).__name__}: {e}"
     if not new_annos:
-        return True, "nothing new to annotate"
+        return True, 0, None
     ok, err = save_turn_annotations(
         subject_id, "log", new_annos, annotate.MODEL, log_filename=log_filename
     )
+    return ok, (len(new_annos) if ok else 0), (None if ok else (err or "save failed"))
+
+
+def _annotate_log_for(
+    subject_id: str, raw_jsonl: str, log_filename: str, force: bool = False
+) -> tuple[bool, str]:
+    """Tag every not-yet-annotated turn in one of a participant's session logs —
+    or, with force=True, every turn, overwriting whatever's already there."""
+    ok, n, err = _annotate_log_core(subject_id, raw_jsonl, log_filename, force)
+    if not ok:
+        return False, err
     verb = "re-annotated" if force else "annotated"
-    return (ok, f"{verb} {len(new_annos)} turn(s)" if ok else (err or "save failed"))
+    return True, f"{verb} {n} turn(s)" if n else "nothing new to annotate"
+
+
+def _annotate_all_logs_for(
+    subject_id: str, logs: list[dict], force: bool = False
+) -> tuple[bool, str]:
+    """Tag every not-yet-annotated turn across ALL of a participant's session
+    logs (or every turn, with force=True), combined into a single result."""
+    total = 0
+    errors = []
+    for lg in logs:
+        ok, n, err = _annotate_log_core(subject_id, lg["raw_jsonl"], lg["filename"], force)
+        if not ok:
+            errors.append(f"{lg['filename']}: {err}")
+        else:
+            total += n
+    if errors:
+        return False, "; ".join(errors)
+    verb = "re-annotated" if force else "annotated"
+    return True, (f"{verb} {total} turn(s) across {len(logs)} log(s)" if total else "nothing new to annotate")
 
 
 def _annotate_transcript_for(
@@ -198,10 +236,10 @@ def _decode_upload(up) -> str:
         return up.getvalue().decode("latin-1")
 
 
-def _doc_upload_widget(sid: str, doc_type: str, label: str) -> None:
-    """A small re-upload control for one of the five reflection docs — always
-    saved under the canonical filename regardless of what the local file is
-    called, so it lines up with what the rest of Admin expects to see."""
+def _doc_upload_widget(sid: str, doc_type: str, label: str, exists: bool) -> None:
+    """A small re-upload / delete control for one of the five reflection docs —
+    uploads always save under the canonical filename regardless of what the
+    local file is called, so it lines up with what the rest of Admin expects."""
     up = st.file_uploader(f"Replace {label}", type=["md"], key=f"up_{doc_type}")
     if up is not None and st.button(f"Save {label}", key=f"save_{doc_type}"):
         content = _decode_upload(up)
@@ -210,12 +248,21 @@ def _doc_upload_widget(sid: str, doc_type: str, label: str) -> None:
         (st.success if ok else st.error)("Saved." if ok else f"Not saved: {err}")
         if ok:
             st.rerun()
+    if exists:
+        c_conf, c_del = st.columns([2, 1])
+        confirm = c_conf.checkbox("Confirm delete", key=f"confirm_del_{doc_type}")
+        if c_del.button(f"🗑️ Delete {label}", key=f"del_{doc_type}", disabled=not confirm):
+            ok, err = delete_participant_file(sid, doc_type)
+            (st.success if ok else st.error)("Deleted." if ok else f"Not deleted: {err}")
+            if ok:
+                st.rerun()
 
 
-def _notebook_upload_widget(sid: str) -> None:
-    """Replace the participant's notebook. Clears existing verbal-assessment
-    fact-checks (they were checked against the old notebook content) but leaves
-    any existing grade alone -- it's just stale until Re-grade is clicked."""
+def _notebook_upload_widget(sid: str, exists: bool) -> None:
+    """Replace or delete the participant's notebook. Either way, clears existing
+    verbal-assessment fact-checks (they were checked against the old notebook
+    content); replacing leaves any existing grade alone -- it's just stale until
+    Re-grade is clicked."""
     up = st.file_uploader("Replace notebook (.ipynb)", type=["ipynb"], key="up_notebook")
     if up is not None and st.button("Save notebook", key="save_notebook"):
         try:
@@ -237,6 +284,14 @@ def _notebook_upload_widget(sid: str) -> None:
             st.rerun()
         else:
             st.error(f"Not saved: {err}")
+    if exists:
+        c_conf, c_del = st.columns([2, 1])
+        confirm = c_conf.checkbox("Confirm delete", key="confirm_del_notebook")
+        if c_del.button("🗑️ Delete notebook", key="del_notebook", disabled=not confirm):
+            ok, err = delete_participant_notebook(sid)
+            (st.success if ok else st.error)("Deleted." if ok else f"Not deleted: {err}")
+            if ok:
+                st.rerun()
 
 
 tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
@@ -316,7 +371,7 @@ with tab_detail:
             else:
                 st.caption("No task plan on file.")
             with st.expander("Upload / replace"):
-                _doc_upload_widget(sid, "task_plan", DOC_TITLES["task_plan"])
+                _doc_upload_widget(sid, "task_plan", DOC_TITLES["task_plan"], "task_plan" in docs)
 
         for sub, left, right in (
             (sub_debug, "debug_manual", "debug_ai"),
@@ -329,7 +384,7 @@ with tab_detail:
                         st.markdown(f"**{DOC_TITLES[key]}**")
                         st.markdown(docs[key]["content"] if key in docs else "_missing_")
                         with st.expander("Upload / replace"):
-                            _doc_upload_widget(sid, key, DOC_TITLES[key])
+                            _doc_upload_widget(sid, key, DOC_TITLES[key], key in docs)
 
         with sub_notebook:
             if nb and nb.get("results"):
@@ -376,7 +431,7 @@ with tab_detail:
             else:
                 st.caption("No notebook on file.")
             with st.expander("Upload / replace notebook"):
-                _notebook_upload_widget(sid)
+                _notebook_upload_widget(sid, nb is not None)
 
         with sub_quiz:
             if bundle["quiz"]:
@@ -465,34 +520,11 @@ with tab_detail:
             if not logs:
                 st.caption("No session log on file.")
             else:
+                raw_by_filename = {lg["filename"]: lg["raw_jsonl"] for lg in logs}
+                merged = merge_parsed([parse_jsonl(raw) for raw in raw_by_filename.values()])
                 if len(logs) > 1:
-                    merged = merge_parsed([parse_jsonl(lg["raw_jsonl"]) for lg in logs])
-                    cm = compute_log_metrics(merged)
-                    with st.expander(f"Combined across {len(logs)} logs", expanded=False):
-                        mc0 = st.columns(4)
-                        dur0 = (cm.get("session_duration_s") or 0) / 60
-                        mc0[0].metric("Duration", f"{dur0:.1f} min")
-                        if cm.get("format") == "history":
-                            mc0[1].metric("Prompts", cm.get("n_substantive_prompts", 0))
-                            mc0[2].metric("Sessions", cm.get("n_sessions", 0))
-                            g0 = cm.get("median_inter_prompt_gap_s")
-                            mc0[3].metric("Median gap", f"{g0:.0f}s" if g0 is not None else "—")
-                        else:
-                            mc0[1].metric("Tool calls", cm.get("n_tool_calls", 0))
-                            mc0[2].metric("File edits", cm.get("n_edits", 0))
-                            ttf0 = cm.get("time_to_first_tool_call_s")
-                            mc0[3].metric("To 1st tool", f"{ttf0:.0f}s" if ttf0 is not None else "—")
-
-                log_names = [lg["filename"] for lg in logs]
-                sel = st.selectbox(
-                    "Log file", range(len(logs)), index=len(logs) - 1,  # most recent
-                    format_func=lambda i: log_names[i], key="log_pick",
-                )
-                log = logs[sel]
-                log_filename = log["filename"]
-
-                parsed_log = parse_jsonl(log["raw_jsonl"])
-                metrics = compute_log_metrics(parsed_log)
+                    st.caption(f"Combined across {len(logs)} logs: " + ", ".join(f"`{n}`" for n in raw_by_filename))
+                metrics = compute_log_metrics(merged)
                 mc = st.columns(4)
                 dur = (metrics.get("session_duration_s") or 0) / 60
                 mc[0].metric("Duration", f"{dur:.1f} min")
@@ -506,71 +538,103 @@ with tab_detail:
                     mc[2].metric("File edits", metrics.get("n_edits", 0))
                     ttf = metrics.get("time_to_first_tool_call_s")
                     mc[3].metric("To 1st tool", f"{ttf:.0f}s" if ttf is not None else "—")
-                render_timeline(log["raw_jsonl"], key=f"{sid}_{log_filename}")
+                render_parsed_timeline(merged, key=sid)
 
                 st.markdown("#### Turn annotations")
-                prompt_events = [e for e in parsed_log["events"] if e["lane"] == "User Prompt"]
+                # Per-log parses (original, un-offset turn numbers) interleaved by
+                # real time -- annotations are stored keyed by each log's own
+                # turn numbering, not merged's collision-safe offset numbering.
+                tagged_prompts = []
+                for fn, raw in raw_by_filename.items():
+                    for e in parse_jsonl(raw)["events"]:
+                        if e["lane"] == "User Prompt":
+                            tagged_prompts.append((fn, e))
+                tagged_prompts.sort(key=lambda pair: pair[1]["t"])
+
                 anno_map = {
-                    a["turn_index"]: a for a in list_turn_annotations(sid)
-                    if a["source"] == "log" and a.get("log_filename") == log_filename
+                    (a["log_filename"], a["turn_index"]): a
+                    for a in list_turn_annotations(sid) if a["source"] == "log"
                 }
-                n_missing = len(prompt_events) - len(anno_map)
+                n_missing = sum(1 for fn, e in tagged_prompts if (fn, e["turn"]) not in anno_map)
                 c_btn, c_force = st.columns([2, 2])
-                force_log = c_force.checkbox(
-                    "Re-annotate everything", key=f"force_reannotate_log_{log_filename}"
-                )
-                n_target = len(prompt_events) if force_log else n_missing
+                force_log = c_force.checkbox("Re-annotate everything", key="force_reannotate_log")
+                n_target = len(tagged_prompts) if force_log else n_missing
                 if c_btn.button(
                     f"🏷️ {'Re-annotate' if force_log else 'Annotate'} ({n_target})"
                     if n_target else "🏷️ Annotate (up to date)",
-                    key=f"annotate_log_{log_filename}", disabled=n_target == 0,
+                    key="annotate_log", disabled=n_target == 0,
                 ):
-                    with st.spinner("Annotating…"):
-                        ok, msg = _annotate_log_for(
-                            sid, log["raw_jsonl"], log_filename, force=force_log
-                        )
+                    with st.spinner(f"Annotating across {len(logs)} log(s)…"):
+                        ok, msg = _annotate_all_logs_for(sid, logs, force=force_log)
                     (st.success if ok else st.error)(msg)
                     st.rerun()
                 if anno_map:
-                    for e in prompt_events:
-                        a = anno_map.get(e["turn"])
+                    for fn, e in tagged_prompts:
+                        a = anno_map.get((fn, e["turn"]))
                         if not a:
                             continue
                         c_lbl, c_tag = st.columns([6, 1])
+                        prefix = f"`{fn}` · " if len(logs) > 1 else ""
                         c_lbl.caption(
-                            f"Turn {e['turn']} · **{a['phase']}** · "
+                            f"{prefix}Turn {e['turn']} · **{a['phase']}** · "
                             f"{a['delegation_posture']} · {a['trust_behavior']}"
                         )
                         with c_tag.popover("💬"):
                             st.write(a.get("turn_text") or "")
                             st.caption(a.get("reasoning") or "")
                             if st.button(
-                                "🔄 Re-annotate this turn",
-                                key=f"reanno_log_{log_filename}_{e['turn']}",
+                                "🔄 Re-annotate this turn", key=f"reanno_log_{fn}_{e['turn']}"
                             ):
                                 with st.spinner("Re-annotating…"):
                                     ok, msg = _reannotate_one_log_turn(
-                                        sid, log["raw_jsonl"], log_filename, e["turn"]
+                                        sid, raw_by_filename[fn], fn, e["turn"]
                                     )
                                 (st.success if ok else st.error)(msg)
                                 st.rerun()
                 else:
                     st.caption("No annotations yet — click Annotate above.")
 
+                st.divider()
+                st.markdown("#### Manage logs")
+                for lg in logs:
+                    c_name, c_conf, c_del = st.columns([4, 2, 1])
+                    c_name.write(f"`{lg['filename']}`")
+                    confirm = c_conf.checkbox(
+                        "Confirm delete", key=f"confirm_del_log_{lg['filename']}"
+                    )
+                    if c_del.button(
+                        "🗑️", key=f"del_log_{lg['filename']}", disabled=not confirm
+                    ):
+                        ok, err = delete_participant_log(sid, lg["filename"])
+                        (st.success if ok else st.error)(
+                            f"Deleted `{lg['filename']}`." if ok else f"Not deleted: {err}"
+                        )
+                        if ok:
+                            st.rerun()
+
             st.divider()
-            st.markdown("#### Add a log")
+            st.markdown("#### Add log(s)")
             st.caption(
-                "Adds another session-log file for this participant (e.g. a separate "
-                "work session) — the uploaded file's own name is used as-is. "
-                "Re-uploading a name already on file replaces just that log."
+                "Adds session-log file(s) for this participant (e.g. separate work "
+                "sessions) — select multiple at once if you have them. Each "
+                "uploaded file's own name is used as-is; re-uploading a name "
+                "already on file replaces just that log."
             )
-            up = st.file_uploader("Session log (.jsonl)", type=["jsonl"], key="up_log")
-            if up is not None and st.button("Save log", key="save_log"):
-                raw_jsonl = up.getvalue().decode("utf-8", errors="replace")
-                new_metrics = compute_log_metrics(parse_jsonl(raw_jsonl))
-                ok, err = save_participant_log(sid, up.name, raw_jsonl, new_metrics)
-                (st.success if ok else st.error)("Saved." if ok else f"Not saved: {err}")
-                if ok:
+            ups = st.file_uploader(
+                "Session log(s) (.jsonl)", type=["jsonl"], accept_multiple_files=True, key="up_log"
+            )
+            if ups and st.button(f"Save {len(ups)} log(s)", key="save_log"):
+                results = []
+                for up in ups:
+                    raw_jsonl = up.getvalue().decode("utf-8", errors="replace")
+                    new_metrics = compute_log_metrics(parse_jsonl(raw_jsonl))
+                    ok, err = save_participant_log(sid, up.name, raw_jsonl, new_metrics)
+                    results.append((up.name, ok, err))
+                for name, ok, err in results:
+                    (st.success if ok else st.error)(
+                        f"{name}: saved" if ok else f"{name}: not saved ({err})"
+                    )
+                if all(ok for _, ok, _ in results):
                     st.rerun()
 
         with sub_files:

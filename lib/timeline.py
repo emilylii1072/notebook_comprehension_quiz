@@ -663,10 +663,9 @@ def _extract_clicked_idx(points: list) -> int | None:
 
 
 def render_timeline(raw_jsonl: str, key: str) -> None:
-    """Render the swimlane chart for one session with click-to-open detail popups,
-    plus an always-visible event table as a fallback. `key` must be unique per
-    participant so Streamlit keeps the charts distinct.
-    """
+    """Render the swimlane chart for one raw session log. See
+    `render_parsed_timeline` for the reusable body (e.g. for a `merge_parsed`
+    combination of several logs, which has no single raw text to fall back to)."""
     parsed = parse_jsonl(raw_jsonl)
     if not parsed["events"]:
         st.warning(
@@ -676,6 +675,20 @@ def render_timeline(raw_jsonl: str, key: str) -> None:
         )
         with st.expander("First lines of the file"):
             st.code("\n".join(raw_jsonl.splitlines()[:8]) or "(empty)")
+        return
+    render_parsed_timeline(parsed, key)
+
+
+def render_parsed_timeline(parsed: dict, key: str) -> None:
+    """Render the swimlane chart for an already-parsed session — a single
+    `parse_jsonl` result or a `merge_parsed` combination of several — with
+    click-to-open detail popups, plus an always-visible event table as a
+    fallback. `key` must be unique so Streamlit keeps the charts distinct.
+    """
+    if not parsed["events"]:
+        st.warning(
+            f"No recognizable turns ({parsed['skipped']} line(s) skipped)."
+        )
         return
     if parsed.get("format") == "history":
         st.caption(

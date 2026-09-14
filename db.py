@@ -409,6 +409,20 @@ def save_participant_file(
         return False, str(e)
 
 
+def delete_participant_file(subject_id: str, doc_type: str) -> tuple[bool, str | None]:
+    """Remove one of a participant's reflection docs (by doc_type)."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_files").delete().eq(
+            "subject_id", subject_id
+        ).eq("doc_type", doc_type).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def save_participant_notebook(
     subject_id: str, filename: str, notebook_text: str
 ) -> tuple[bool, str | None]:
@@ -427,6 +441,20 @@ def save_participant_notebook(
         return True, None
     except Exception as e:
         return False, str(e)
+
+
+def delete_participant_notebook(subject_id: str) -> tuple[bool, str | None]:
+    """Remove the participant's notebook (grade included, same row). Also clears
+    verbal-assessment fact-checks, since they were checked against this notebook."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_notebooks").delete().eq("subject_id", subject_id).execute()
+    except Exception as e:
+        return False, str(e)
+    delete_turn_annotations(subject_id, "transcript")
+    return True, None
 
 
 def update_participant_grading(
@@ -527,6 +555,22 @@ def save_participant_log(
         return False, str(e)
     if content_changed:
         delete_turn_annotations(subject_id, "log", filename)
+    return True, None
+
+
+def delete_participant_log(subject_id: str, filename: str) -> tuple[bool, str | None]:
+    """Remove one of a participant's log files (by filename) and its turn
+    annotations, leaving any other logs on file untouched."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_logs").delete().eq(
+            "subject_id", subject_id
+        ).eq("filename", filename).execute()
+    except Exception as e:
+        return False, str(e)
+    delete_turn_annotations(subject_id, "log", filename)
     return True, None
 
 
