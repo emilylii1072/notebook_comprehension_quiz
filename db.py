@@ -785,25 +785,30 @@ def list_graded_participant_notebooks() -> dict:
     }
 
 
-def list_pending_grading() -> list[dict]:
-    """Participants whose notebook still needs grading (status pending/error).
+def list_pending_grading(include_graded: bool = False) -> list[dict]:
+    """Participants whose notebook needs (re-)grading.
+
+    By default only status pending/error. With include_graded=True, every
+    participant with a notebook on file — so a newly uploaded/replaced rubric
+    can be re-applied to notebooks that were already graded under the old one.
     Returns [{"subject_id", "notebook_text", "filename"}]."""
     client = get_supabase_client()
     if client is None:
         return []
     try:
-        parts = (
-            client.table("participants").select("subject_id,grading_status")
-            .in_("grading_status", ["pending", "error"]).execute().data or []
-        )
-        ids = [p["subject_id"] for p in parts]
-        if not ids:
-            return []
-        nbs = (
-            client.table("participant_notebooks")
-            .select("subject_id,filename,notebook_text")
-            .in_("subject_id", ids).execute().data or []
-        )
-        return nbs
+        if include_graded:
+            ids = None
+        else:
+            parts = (
+                client.table("participants").select("subject_id,grading_status")
+                .in_("grading_status", ["pending", "error"]).execute().data or []
+            )
+            ids = [p["subject_id"] for p in parts]
+            if not ids:
+                return []
+        q = client.table("participant_notebooks").select("subject_id,filename,notebook_text")
+        if ids is not None:
+            q = q.in_("subject_id", ids)
+        return q.execute().data or []
     except Exception:
         return []

@@ -187,6 +187,11 @@ with tab_detail:
                 if nb.get("notebook_text"):
                     with st.expander("Notebook transcript (as graded)"):
                         st.code(nb["notebook_text"])
+                if st.button("Re-grade with current rubric", key="regrade_detail"):
+                    with st.spinner("Grading…"):
+                        ok, msg = _grade_one(sid, nb["notebook_text"])
+                    (st.success if ok else st.error)(msg)
+                    st.rerun()
             elif nb:
                 st.caption("Notebook stored but not graded yet.")
                 if st.button("Grade now", key="grade_now_detail"):
@@ -359,8 +364,14 @@ with tab_grading:
 
     st.divider()
     st.markdown("#### Grade pending participants")
-    pending = list_pending_grading()
-    st.caption(f"{len(pending)} participant notebook(s) pending or errored.")
+    regrade_all = st.checkbox(
+        "Include already-graded notebooks (re-grade everyone against the rubric above)"
+    )
+    pending = list_pending_grading(include_graded=regrade_all)
+    st.caption(
+        f"{len(pending)} participant notebook(s) "
+        + ("on file." if regrade_all else "pending or errored.")
+    )
     if pending and st.button(f"Grade {len(pending)} notebook(s)", type="primary"):
         prog = st.progress(0.0, text="Starting…")
         for i, row in enumerate(pending):
