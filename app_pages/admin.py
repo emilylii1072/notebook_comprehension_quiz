@@ -322,9 +322,20 @@ with tab_grading:
         f"Hidden-synchronous grading uses the rubric named **`{ACTIVE_RUBRIC_NAME}`** "
         "(override with the `ACTIVE_RUBRIC_NAME` secret)."
     )
+    # The save button below calls st.rerun() right after saving — without this,
+    # the success/error message it shows gets wiped before it ever renders, so
+    # a save silently *looks* like it did nothing even when it worked.
+    _flash = st.session_state.pop("_rubric_save_msg", None)
+    if _flash is not None:
+        (st.success if _flash[0] else st.error)(_flash[1])
+
     active = get_rubric(ACTIVE_RUBRIC_NAME)
     if active and (active.get("rubric_csv") or "").strip():
-        st.success(f"Rubric `{ACTIVE_RUBRIC_NAME}` is configured.")
+        _upd = active.get("updated_at")
+        st.success(
+            f"Rubric `{ACTIVE_RUBRIC_NAME}` is configured"
+            + (f" · last saved {_upd}" if _upd else "") + "."
+        )
     else:
         st.error(
             f"No usable rubric `{ACTIVE_RUBRIC_NAME}` — new submissions will save but "
@@ -353,7 +364,10 @@ with tab_grading:
         except UnicodeDecodeError:
             csv_text = up.getvalue().decode("latin-1")
         ok, err = save_rubric(name, task_text, csv_text)
-        (st.success if ok else st.error)("Saved." if ok else f"Not saved: {err}")
+        st.session_state["_rubric_save_msg"] = (
+            ok, f"Saved `{name}` ({len(csv_text.splitlines())} CSV line(s))." if ok
+            else f"Not saved: {err}"
+        )
         st.rerun()
 
     if active and (active.get("rubric_csv") or "").strip():
