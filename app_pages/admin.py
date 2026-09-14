@@ -139,6 +139,38 @@ def _annotate_transcript_for(
     return (ok, f"{verb} {len(new_annos)} turn(s)" if ok else (err or "save failed"))
 
 
+def _reannotate_one_log_turn(subject_id: str, raw_jsonl: str, turn: int) -> tuple[bool, str]:
+    """Re-annotate exactly one turn in a participant's session log, leaving every
+    other turn's existing tag untouched."""
+    parsed = parse_jsonl(raw_jsonl)
+    all_turns = {e["turn"] for e in parsed["events"] if e["lane"] == "User Prompt"}
+    skip = frozenset(all_turns - {turn})
+    try:
+        new_annos = annotate.annotate_log(get_client(), parsed, skip)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if not new_annos:
+        return False, "turn not found"
+    ok, err = save_turn_annotations(subject_id, "log", new_annos, annotate.MODEL)
+    return (ok, "re-annotated" if ok else (err or "save failed"))
+
+
+def _reannotate_one_transcript_pair(
+    subject_id: str, pairs: list[dict], notebook_text: str, idx: int
+) -> tuple[bool, str]:
+    """Re-check exactly one Q/A pair against the notebook, leaving every other
+    pair's existing tag untouched."""
+    skip = frozenset(set(range(len(pairs))) - {idx})
+    try:
+        new_annos = annotate.annotate_transcript(get_client(), pairs, notebook_text, skip)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if not new_annos:
+        return False, "pair not found"
+    ok, err = save_turn_annotations(subject_id, "transcript", new_annos, annotate.MODEL)
+    return (ok, "re-checked" if ok else (err or "save failed"))
+
+
 tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
     ["1 · Overview", "2 · Participant", "3 · Cohort stats",
      "4 · Notebook report", "5 · Grading & rubric"]
@@ -312,6 +344,13 @@ with tab_detail:
                         with c_tag.popover("💬"):
                             st.caption(f"**{a['accuracy']}**")
                             st.write(a.get("reasoning") or "")
+                            if st.button("🔄 Re-check this answer", key=f"reanno_tr_{i}"):
+                                with st.spinner("Re-checking…"):
+                                    ok, msg = _reannotate_one_transcript_pair(
+                                        sid, pairs, notebook_text, i
+                                    )
+                                (st.success if ok else st.error)(msg)
+                                st.rerun()
                 if not pairs:
                     st.caption("Uploaded but not parsed — use Re-parse below.")
                 with st.expander("Raw transcript"):
@@ -395,6 +434,13 @@ with tab_detail:
                         with c_tag.popover("💬"):
                             st.write(a.get("turn_text") or "")
                             st.caption(a.get("reasoning") or "")
+                            if st.button("🔄 Re-annotate this turn", key=f"reanno_log_{e['turn']}"):
+                                with st.spinner("Re-annotating…"):
+                                    ok, msg = _reannotate_one_log_turn(
+                                        sid, log["raw_jsonl"], e["turn"]
+                                    )
+                                (st.success if ok else st.error)(msg)
+                                st.rerun()
                 else:
                     st.caption("No annotations yet — click Annotate above.")
             else:
