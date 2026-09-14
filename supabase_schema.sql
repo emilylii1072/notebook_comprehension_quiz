@@ -194,6 +194,27 @@ create table if not exists participant_transcripts (
 
 alter table participant_transcripts enable row level security;
 
+-- Auto-annotation: one row per participant turn (a session-log user prompt, or a
+-- verbal-assessment Q&A pair), tagged by lib.annotate via one LLM call per turn.
+create table if not exists participant_turn_annotations (
+  subject_id text not null references participants (subject_id) on delete cascade,
+  source text not null,          -- 'log' | 'transcript'
+  turn_index int not null,       -- log: the event's `turn` field; transcript: pair list index
+  turn_text text not null,       -- snapshot of what was annotated, for audit/display
+  phase text,                    -- planning | implementing | debugging | verifying | reflecting
+  delegation_posture text,       -- high_level_ask | step_by_step | clarifying_question
+  trust_behavior text,           -- accepts_unreviewed | reviews_edits | rejects_redirects | insufficient_context
+  reasoning text,                -- short model-written justification
+  model text not null,
+  created_at timestamptz not null default now(),
+  primary key (subject_id, source, turn_index)
+);
+
+create index if not exists participant_turn_annotations_subject_idx
+  on participant_turn_annotations (subject_id);
+
+alter table participant_turn_annotations enable row level security;
+
 
 -- ---------------------------------------------------------------------------
 -- Migrations for databases created from an earlier version of this file

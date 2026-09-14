@@ -367,7 +367,8 @@ def upsert_participant(subject_id: str, condition: str) -> tuple[bool, str | Non
         return False, "Database not configured (SUPABASE_URL/SUPABASE_KEY not set)."
     try:
         for table in ("participant_files", "participant_notebooks",
-                      "participant_quiz", "participant_logs"):
+                      "participant_quiz", "participant_logs",
+                      "participant_turn_annotations"):
             client.table(table).delete().eq("subject_id", subject_id).execute()
         client.table("participants").upsert(
             {
@@ -720,6 +721,102 @@ def list_participant_logs_raw() -> list[dict]:
         )
     except Exception:
         return []
+
+
+def list_participant_transcripts_raw() -> list[dict]:
+    """[{subject_id, filename, parsed}] — for bulk-annotating verbal-assessment
+    transcripts. `parsed` is [{"timestamp","question","answer"}, ...] or None if
+    the transcript was uploaded but never parsed."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        return (
+            client.table("participant_transcripts")
+            .select("subject_id,filename,parsed").execute().data or []
+        )
+    except Exception:
+        return []
+
+
+def save_turn_annotations(
+    subject_id: str, source: str, annotations: list[dict], model: str
+) -> tuple[bool, str | None]:
+    """Add these turn annotations for (subject_id, source) — callers only pass
+    turns that weren't already annotated (see annotate_turn_indexes / lib.annotate's
+    skip_turn_indexes), so this is an append, not a replace. Upserts on the
+    composite PK as a safety net against a duplicate call landing twice."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    if not annotations:
+        return True, None
+    try:
+        client.table("participant_turn_annotations").upsert(
+            [
+                {"subject_id": subject_id, "source": source, "model": model, **a}
+                for a in annotations
+            ],
+            on_conflict="subject_id,source,turn_index",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def annotated_turn_indexes(subject_id: str, source: str) -> set[int]:
+    """Which turn_index values already have an annotation for (subject_id, source)
+    — used to skip already-annotated turns on a re-run."""
+    client = get_supabase_client()
+    if client is None:
+        return set()
+    try:
+        rows = (
+            client.table("participant_turn_annotations")
+            .select("turn_index").eq("subject_id", subject_id).eq("source", source)
+            .execute().data or []
+        )
+    except Exception:
+        return set()
+    return {r["turn_index"] for r in rows}
+
+
+def list_turn_annotations(subject_id: str) -> list[dict]:
+    """All turn annotations for one participant, ordered for display."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        rows = (
+            client.table("participant_turn_annotations")
+            .select("*").eq("subject_id", subject_id).execute().data or []
+        )
+    except Exception:
+        return []
+    return sorted(rows, key=lambda r: (r.get("source", ""), r.get("turn_index", 0)))
+
+
+def list_all_turn_annotations() -> list[dict]:
+    """[{subject_id, condition, source, phase, delegation_posture, trust_behavior}]
+    — every turn annotation joined with condition, for the cohort tag-distribution
+    charts."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        conds = {
+            r["subject_id"]: r.get("condition")
+            for r in (client.table("participants")
+                      .select("subject_id,condition").execute().data or [])
+        }
+        rows = (
+            client.table("participant_turn_annotations")
+            .select("subject_id,source,phase,delegation_posture,trust_behavior")
+            .execute().data or []
+        )
+    except Exception:
+        return []
+    return [{**r, "condition": conds.get(r["subject_id"])} for r in rows]
 
 
 def list_notebook_section_scores() -> list[dict]:

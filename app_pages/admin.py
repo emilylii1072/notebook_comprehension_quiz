@@ -4,11 +4,17 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Five top-level tabs:
   1. Overview        — one row per participant, filter by condition, CSV export
   2. Participant     — sub-tabs per task/data type: Task plan, Debug (manual vs
                        AI), Ideate (manual vs AI), Notebook grade, Quiz, Verbal
-                       assessment, Session timeline, Raw files
+                       assessment, Session timeline, Raw files. The Verbal
+                       assessment and Session timeline sub-tabs also carry
+                       per-participant turn annotation: an "Annotate" button tags
+                       every not-yet-tagged turn, shown in place as 💬 popovers
+                       (phase / delegation posture / trust behaviour + reasoning).
   3. Cohort stats    — outcomes + behaviour overall and split by condition
   4. Notebook report — the visual grading report across all graded notebooks
   5. Grading         — browse/upload any rubric version, grade or re-grade
-                       (individually or in bulk) against whichever one you pick
+                       (individually or in bulk) against whichever one you pick;
+                       also hosts "Annotate everything pending" (lib/annotate.py),
+                       the cross-participant bulk version of the turn tagging above
 
 One page of the multipage app — run via `streamlit run app.py`.
 """
@@ -22,6 +28,7 @@ from dotenv import load_dotenv
 
 from build_report import records_from_graded, render_report
 from db import (
+    annotated_turn_indexes,
     get_participant_bundle,
     get_rubric,
     get_secret,
@@ -29,16 +36,19 @@ from db import (
     list_notebook_section_scores,
     list_participant_logs_raw,
     list_participant_summaries,
+    list_participant_transcripts_raw,
     list_pending_grading,
     list_rubrics,
+    list_turn_annotations,
     save_participant_log,
     save_participant_transcript,
     save_rubric,
+    save_turn_annotations,
     set_participant_grading_error,
     supabase_status,
     update_participant_grading,
 )
-from lib import cohort, grading, transcript
+from lib import annotate, cohort, grading, transcript
 from lib.llm import get_client
 from lib.quiz_ui import render_quiz_breakdown
 from lib.timeline import compute_log_metrics, parse_jsonl, render_timeline
@@ -91,6 +101,32 @@ def _grade_one(subject_id: str, notebook_text: str, rubric_name: str) -> tuple[b
         subject_id, rubric_name, grading.MODEL, results, total, mx
     )
     return (ok, "graded" if ok else (err or "save failed"))
+
+
+def _annotate_log_for(subject_id: str, raw_jsonl: str) -> tuple[bool, str]:
+    """Tag every not-yet-annotated turn in one participant's session log."""
+    existing = frozenset(annotated_turn_indexes(subject_id, "log"))
+    try:
+        new_annos = annotate.annotate_log(get_client(), parse_jsonl(raw_jsonl), existing)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if not new_annos:
+        return True, "nothing new to annotate"
+    ok, err = save_turn_annotations(subject_id, "log", new_annos, annotate.MODEL)
+    return (ok, f"annotated {len(new_annos)} turn(s)" if ok else (err or "save failed"))
+
+
+def _annotate_transcript_for(subject_id: str, pairs: list[dict]) -> tuple[bool, str]:
+    """Tag every not-yet-annotated Q/A pair in one participant's verbal transcript."""
+    existing = frozenset(annotated_turn_indexes(subject_id, "transcript"))
+    try:
+        new_annos = annotate.annotate_transcript(get_client(), pairs, existing)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if not new_annos:
+        return True, "nothing new to annotate"
+    ok, err = save_turn_annotations(subject_id, "transcript", new_annos, annotate.MODEL)
+    return (ok, f"annotated {len(new_annos)} turn(s)" if ok else (err or "save failed"))
 
 
 tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
@@ -236,9 +272,31 @@ with tab_detail:
             tr = bundle["transcript"]
             if tr:
                 pairs = tr.get("parsed") or []
-                for pr in pairs:
-                    st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
-                    st.markdown(pr.get("answer") or "_(no answer)_")
+                anno_map = {
+                    a["turn_index"]: a for a in list_turn_annotations(sid) if a["source"] == "transcript"
+                }
+                if pairs:
+                    n_missing = len(pairs) - len(anno_map)
+                    if st.button(
+                        f"🏷️ Annotate ({n_missing} new)" if n_missing else "🏷️ Annotate (up to date)",
+                        key="annotate_tr", disabled=n_missing == 0,
+                    ):
+                        with st.spinner("Annotating…"):
+                            ok, msg = _annotate_transcript_for(sid, pairs)
+                        (st.success if ok else st.error)(msg)
+                        st.rerun()
+                for i, pr in enumerate(pairs):
+                    c_qa, c_tag = st.columns([6, 1])
+                    with c_qa:
+                        st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
+                        st.markdown(pr.get("answer") or "_(no answer)_")
+                    a = anno_map.get(i)
+                    if a:
+                        with c_tag.popover("💬"):
+                            st.caption(
+                                f"**{a['phase']}** · {a['delegation_posture']} · {a['trust_behavior']}"
+                            )
+                            st.write(a.get("reasoning") or "")
                 if not pairs:
                     st.caption("Uploaded but not parsed — use Re-parse below.")
                 with st.expander("Raw transcript"):
@@ -274,7 +332,8 @@ with tab_detail:
 
         with sub_timeline:
             if log and log.get("raw_jsonl"):
-                metrics = compute_log_metrics(parse_jsonl(log["raw_jsonl"]))  # recompute live
+                parsed_log = parse_jsonl(log["raw_jsonl"])
+                metrics = compute_log_metrics(parsed_log)
                 mc = st.columns(4)
                 dur = (metrics.get("session_duration_s") or 0) / 60
                 mc[0].metric("Duration", f"{dur:.1f} min")
@@ -289,6 +348,36 @@ with tab_detail:
                     ttf = metrics.get("time_to_first_tool_call_s")
                     mc[3].metric("To 1st tool", f"{ttf:.0f}s" if ttf is not None else "—")
                 render_timeline(log["raw_jsonl"], key=sid)
+
+                st.markdown("#### Turn annotations")
+                prompt_events = [e for e in parsed_log["events"] if e["lane"] == "User Prompt"]
+                anno_map = {
+                    a["turn_index"]: a for a in list_turn_annotations(sid) if a["source"] == "log"
+                }
+                n_missing = len(prompt_events) - len(anno_map)
+                if st.button(
+                    f"🏷️ Annotate ({n_missing} new)" if n_missing else "🏷️ Annotate (up to date)",
+                    key="annotate_log", disabled=n_missing == 0,
+                ):
+                    with st.spinner("Annotating…"):
+                        ok, msg = _annotate_log_for(sid, log["raw_jsonl"])
+                    (st.success if ok else st.error)(msg)
+                    st.rerun()
+                if anno_map:
+                    for e in prompt_events:
+                        a = anno_map.get(e["turn"])
+                        if not a:
+                            continue
+                        c_lbl, c_tag = st.columns([6, 1])
+                        c_lbl.caption(
+                            f"Turn {e['turn']} · **{a['phase']}** · "
+                            f"{a['delegation_posture']} · {a['trust_behavior']}"
+                        )
+                        with c_tag.popover("💬"):
+                            st.write(a.get("turn_text") or "")
+                            st.caption(a.get("reasoning") or "")
+                else:
+                    st.caption("No annotations yet — click Annotate above.")
             else:
                 st.caption("No session log on file.")
 
@@ -455,6 +544,51 @@ with tab_grading:
             ok, _ = save_participant_log(row["subject_id"], row["filename"], row["raw_jsonl"], m)
             n += int(ok)
         st.success(f"Re-parsed {n}/{len(logs)} log(s).")
+        st.rerun()
+
+    st.divider()
+    st.markdown("#### Annotate everything pending")
+    st.caption(
+        "Tags every not-yet-annotated turn — a session-log prompt or a verbal-"
+        "assessment Q/A pair — across every participant. One LLM call per turn; "
+        "already-annotated turns are skipped, so this is safe to re-run."
+    )
+    _pending_logs = []
+    for row in list_participant_logs_raw():
+        n_prompts = sum(
+            1 for e in parse_jsonl(row["raw_jsonl"])["events"] if e["lane"] == "User Prompt"
+        )
+        n_missing = n_prompts - len(annotated_turn_indexes(row["subject_id"], "log"))
+        if n_missing:
+            _pending_logs.append((row, n_missing))
+    _pending_trs = []
+    for row in list_participant_transcripts_raw():
+        pairs = row.get("parsed") or []
+        n_missing = len(pairs) - len(annotated_turn_indexes(row["subject_id"], "transcript"))
+        if pairs and n_missing:
+            _pending_trs.append((row, n_missing))
+    _total_calls = sum(n for _, n in _pending_logs) + sum(n for _, n in _pending_trs)
+    st.caption(
+        f"{len(_pending_logs)} log(s) and {len(_pending_trs)} transcript(s) have new "
+        f"turns — about {_total_calls} call(s) total."
+    )
+    if _total_calls and st.button(
+        f"🏷️ Annotate everything pending ({_total_calls} call(s))", type="primary"
+    ):
+        prog = st.progress(0.0, text="Starting…")
+        n_steps = len(_pending_logs) + len(_pending_trs)
+        step = 0
+        for row, _n in _pending_logs:
+            step += 1
+            prog.progress(step / n_steps, text=f"Annotating {row['subject_id']}'s log…")
+            ok, msg = _annotate_log_for(row["subject_id"], row["raw_jsonl"])
+            st.write(f"{'✅' if ok else '⚠️'} {row['subject_id']} (log): {msg}")
+        for row, _n in _pending_trs:
+            step += 1
+            prog.progress(step / n_steps, text=f"Annotating {row['subject_id']}'s transcript…")
+            ok, msg = _annotate_transcript_for(row["subject_id"], row.get("parsed") or [])
+            st.write(f"{'✅' if ok else '⚠️'} {row['subject_id']} (transcript): {msg}")
+        prog.progress(1.0, text="Done.")
         st.rerun()
 
     st.divider()
