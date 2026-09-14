@@ -1,9 +1,10 @@
 """Admin — the researcher's view of every participant.
 
-Password-gated (set ADMIN_PASSWORD in secrets / .env). Five tabs:
+Password-gated (set ADMIN_PASSWORD in secrets / .env). Five top-level tabs:
   1. Overview        — one row per participant, filter by condition, CSV export
-  2. Participant     — the five docs, the graded notebook, the quiz, the verbal
-                       assessment transcript, the session timeline
+  2. Participant     — sub-tabs per task/data type: Task plan, Debug (manual vs
+                       AI), Ideate (manual vs AI), Notebook grade, Quiz, Verbal
+                       assessment, Session timeline, Raw files
   3. Cohort stats    — outcomes + behaviour overall and split by condition
   4. Notebook report — the visual grading report across all graded notebooks
   5. Grading         — the active rubric + "grade all pending"
@@ -141,131 +142,149 @@ with tab_detail:
             st.warning(f"Grading error: {p.get('grading_error')}")
 
         docs = {d["doc_type"]: d for d in bundle["files"]}
-
-        st.markdown("### Documents")
-        if "task_plan" in docs:
-            with st.expander("Task plan", expanded=False):
-                st.markdown(docs["task_plan"]["content"])
-        for left, right in (("debug_manual", "debug_ai"), ("ideate_manual", "ideate_ai")):
-            c1, c2 = st.columns(2)
-            for col, key in ((c1, left), (c2, right)):
-                with col:
-                    st.markdown(f"**{DOC_TITLES[key]}**")
-                    st.markdown(docs[key]["content"] if key in docs else "_missing_")
-
-        st.markdown("### Notebook grade")
         nb = bundle["notebook"]
-        if nb and nb.get("results"):
-            st.metric(
-                "Total",
-                f"{nb.get('total_score')} / {nb.get('max_score')}"
-                + (f"  ({100 * nb['total_score'] / nb['max_score']:.0f}%)"
-                   if nb.get("max_score") else ""),
-            )
-            cohort.render_participant_notebook_sections(nb["results"], _section_rows, sid)
-            with st.expander("Per-criterion detail"):
-                gdf = pd.DataFrame(nb["results"])[
-                    ["section", "criterion", "score", "max_pts", "reasoning"]
-                ]
-                st.dataframe(gdf, hide_index=True, width="stretch")
-        elif nb:
-            st.caption("Notebook stored but not graded yet.")
-            if st.button("Grade now", key="grade_now_detail"):
-                with st.spinner("Grading…"):
-                    ok, msg = _grade_one(sid, nb["notebook_text"])
-                (st.success if ok else st.error)(msg)
-                st.rerun()
-        else:
-            st.caption("No notebook on file.")
-
-        if nb and nb.get("notebook_text"):
-            with st.expander("Notebook transcript (as graded)"):
-                st.code(nb["notebook_text"])
-
-        st.markdown("### Comprehension quiz")
-        if bundle["quiz"]:
-            render_quiz_breakdown(bundle["quiz"])
-        else:
-            st.caption("No quiz result on file.")
-
-        st.markdown("### Verbal assessment")
-        tr = bundle["transcript"]
-        if tr:
-            pairs = tr.get("parsed") or []
-            for pr in pairs:
-                st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
-                st.markdown(pr.get("answer") or "_(no answer)_")
-            if not pairs:
-                st.caption("Uploaded but not parsed — use Re-parse below.")
-            with st.expander("Raw transcript"):
-                st.text(tr["raw_text"])
-            c_re, c_dl = st.columns(2)
-            if c_re.button("Re-parse", key="reparse_tr"):
-                with st.spinner("Parsing…"):
-                    parsed = transcript.call_with_errors_surfaced(
-                        transcript.parse_transcript, get_client(), tr["raw_text"]
-                    )
-                if parsed is not None:
-                    save_participant_transcript(sid, tr["filename"], tr["raw_text"], parsed)
-                    st.rerun()
-            c_dl.download_button(
-                f"⬇️ {tr['filename']}", data=tr["raw_text"], file_name=tr["filename"],
-                mime="text/plain", key="dl_tr",
-            )
-        else:
-            up = st.file_uploader(
-                "Verbal assessment transcript (.txt)", type=["txt"], key="tr_up"
-            )
-            if up is not None and st.button("Upload & parse", key="tr_parse", type="primary"):
-                raw = up.getvalue().decode("utf-8", errors="replace")
-                with st.spinner("Parsing the transcript…"):
-                    parsed = transcript.call_with_errors_surfaced(
-                        transcript.parse_transcript, get_client(), raw
-                    )
-                ok, err = save_participant_transcript(sid, up.name, raw, parsed)
-                if not ok:
-                    st.error(f"Could not save: {err}")
-                else:
-                    st.rerun()
-
-        st.markdown("### Session timeline")
         log = bundle["log"]
-        if log and log.get("raw_jsonl"):
-            metrics = compute_log_metrics(parse_jsonl(log["raw_jsonl"]))  # recompute live
-            mc = st.columns(4)
-            dur = (metrics.get("session_duration_s") or 0) / 60
-            mc[0].metric("Duration", f"{dur:.1f} min")
-            if metrics.get("format") == "history":
-                mc[1].metric("Prompts", metrics.get("n_substantive_prompts", 0))
-                mc[2].metric("Sessions", metrics.get("n_sessions", 0))
-                g = metrics.get("median_inter_prompt_gap_s")
-                mc[3].metric("Median gap", f"{g:.0f}s" if g is not None else "—")
-            else:
-                mc[1].metric("Tool calls", metrics.get("n_tool_calls", 0))
-                mc[2].metric("File edits", metrics.get("n_edits", 0))
-                ttf = metrics.get("time_to_first_tool_call_s")
-                mc[3].metric("To 1st tool", f"{ttf:.0f}s" if ttf is not None else "—")
-            render_timeline(log["raw_jsonl"], key=sid)
-        else:
-            st.caption("No session log on file.")
 
-        st.markdown("### Raw files")
-        for d in bundle["files"]:
-            st.download_button(
-                f"⬇️ {d['filename']}", data=d["content"], file_name=d["filename"],
-                mime="text/markdown", key=f"dl_{d['doc_type']}",
-            )
-        if nb:
-            st.download_button(
-                f"⬇️ {nb['filename']} (transcript .txt)", data=nb.get("notebook_text", ""),
-                file_name=nb["filename"].replace(".ipynb", "_transcript.txt"),
-                mime="text/plain", key="dl_nb",
-            )
-        if log:
-            st.download_button(
-                f"⬇️ {log['filename']}", data=log["raw_jsonl"],
-                file_name=log["filename"], mime="application/json", key="dl_log",
-            )
+        (
+            sub_taskplan, sub_debug, sub_ideate,
+            sub_notebook, sub_quiz, sub_verbal, sub_timeline, sub_files,
+        ) = st.tabs([
+            "Task plan", "Debug: manual vs AI", "Ideate: manual vs AI",
+            "Notebook grade", "Quiz", "Verbal assessment", "Session timeline", "Raw files",
+        ])
+
+        with sub_taskplan:
+            if "task_plan" in docs:
+                st.markdown(docs["task_plan"]["content"])
+            else:
+                st.caption("No task plan on file.")
+
+        for sub, left, right in (
+            (sub_debug, "debug_manual", "debug_ai"),
+            (sub_ideate, "ideate_manual", "ideate_ai"),
+        ):
+            with sub:
+                c1, c2 = st.columns(2)
+                for col, key in ((c1, left), (c2, right)):
+                    with col:
+                        st.markdown(f"**{DOC_TITLES[key]}**")
+                        st.markdown(docs[key]["content"] if key in docs else "_missing_")
+
+        with sub_notebook:
+            if nb and nb.get("results"):
+                st.metric(
+                    "Total",
+                    f"{nb.get('total_score')} / {nb.get('max_score')}"
+                    + (f"  ({100 * nb['total_score'] / nb['max_score']:.0f}%)"
+                       if nb.get("max_score") else ""),
+                )
+                cohort.render_participant_notebook_sections(nb["results"], _section_rows, sid)
+                with st.expander("Per-criterion detail"):
+                    gdf = pd.DataFrame(nb["results"])[
+                        ["section", "criterion", "score", "max_pts", "reasoning"]
+                    ]
+                    st.dataframe(gdf, hide_index=True, width="stretch")
+                if nb.get("notebook_text"):
+                    with st.expander("Notebook transcript (as graded)"):
+                        st.code(nb["notebook_text"])
+            elif nb:
+                st.caption("Notebook stored but not graded yet.")
+                if st.button("Grade now", key="grade_now_detail"):
+                    with st.spinner("Grading…"):
+                        ok, msg = _grade_one(sid, nb["notebook_text"])
+                    (st.success if ok else st.error)(msg)
+                    st.rerun()
+                if nb.get("notebook_text"):
+                    with st.expander("Notebook transcript (ungraded)"):
+                        st.code(nb["notebook_text"])
+            else:
+                st.caption("No notebook on file.")
+
+        with sub_quiz:
+            if bundle["quiz"]:
+                render_quiz_breakdown(bundle["quiz"])
+            else:
+                st.caption("No quiz result on file.")
+
+        with sub_verbal:
+            tr = bundle["transcript"]
+            if tr:
+                pairs = tr.get("parsed") or []
+                for pr in pairs:
+                    st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
+                    st.markdown(pr.get("answer") or "_(no answer)_")
+                if not pairs:
+                    st.caption("Uploaded but not parsed — use Re-parse below.")
+                with st.expander("Raw transcript"):
+                    st.text(tr["raw_text"])
+                c_re, c_dl = st.columns(2)
+                if c_re.button("Re-parse", key="reparse_tr"):
+                    with st.spinner("Parsing…"):
+                        parsed = transcript.call_with_errors_surfaced(
+                            transcript.parse_transcript, get_client(), tr["raw_text"]
+                        )
+                    if parsed is not None:
+                        save_participant_transcript(sid, tr["filename"], tr["raw_text"], parsed)
+                        st.rerun()
+                c_dl.download_button(
+                    f"⬇️ {tr['filename']}", data=tr["raw_text"], file_name=tr["filename"],
+                    mime="text/plain", key="dl_tr",
+                )
+            else:
+                up = st.file_uploader(
+                    "Verbal assessment transcript (.txt)", type=["txt"], key="tr_up"
+                )
+                if up is not None and st.button("Upload & parse", key="tr_parse", type="primary"):
+                    raw = up.getvalue().decode("utf-8", errors="replace")
+                    with st.spinner("Parsing the transcript…"):
+                        parsed = transcript.call_with_errors_surfaced(
+                            transcript.parse_transcript, get_client(), raw
+                        )
+                    ok, err = save_participant_transcript(sid, up.name, raw, parsed)
+                    if not ok:
+                        st.error(f"Could not save: {err}")
+                    else:
+                        st.rerun()
+
+        with sub_timeline:
+            if log and log.get("raw_jsonl"):
+                metrics = compute_log_metrics(parse_jsonl(log["raw_jsonl"]))  # recompute live
+                mc = st.columns(4)
+                dur = (metrics.get("session_duration_s") or 0) / 60
+                mc[0].metric("Duration", f"{dur:.1f} min")
+                if metrics.get("format") == "history":
+                    mc[1].metric("Prompts", metrics.get("n_substantive_prompts", 0))
+                    mc[2].metric("Sessions", metrics.get("n_sessions", 0))
+                    g = metrics.get("median_inter_prompt_gap_s")
+                    mc[3].metric("Median gap", f"{g:.0f}s" if g is not None else "—")
+                else:
+                    mc[1].metric("Tool calls", metrics.get("n_tool_calls", 0))
+                    mc[2].metric("File edits", metrics.get("n_edits", 0))
+                    ttf = metrics.get("time_to_first_tool_call_s")
+                    mc[3].metric("To 1st tool", f"{ttf:.0f}s" if ttf is not None else "—")
+                render_timeline(log["raw_jsonl"], key=sid)
+            else:
+                st.caption("No session log on file.")
+
+        with sub_files:
+            for d in bundle["files"]:
+                st.download_button(
+                    f"⬇️ {d['filename']}", data=d["content"], file_name=d["filename"],
+                    mime="text/markdown", key=f"dl_{d['doc_type']}",
+                )
+            if nb:
+                st.download_button(
+                    f"⬇️ {nb['filename']} (transcript .txt)", data=nb.get("notebook_text", ""),
+                    file_name=nb["filename"].replace(".ipynb", "_transcript.txt"),
+                    mime="text/plain", key="dl_nb",
+                )
+            if log:
+                st.download_button(
+                    f"⬇️ {log['filename']}", data=log["raw_jsonl"],
+                    file_name=log["filename"], mime="application/json", key="dl_log",
+                )
+            if not bundle["files"] and not nb and not log:
+                st.caption("No files on record.")
 
 # ---- Tab 3: Cohort statistics ----------------------------------------
 with tab_cohort:
@@ -312,14 +331,23 @@ with tab_grading:
     if existing:
         st.caption("Saved rubrics: " + ", ".join(f"`{r}`" for r in existing))
     name = st.text_input("Rubric name", value=ACTIVE_RUBRIC_NAME)
-    task_text = st.text_area("Task description (graded against)", value=grading.DEFAULT_TASK, height=220)
+    name = name.strip() or ACTIVE_RUBRIC_NAME
+    # Look up whatever's already stored under this name so "replace" doesn't
+    # silently blank a customised task back to the generic template. Keyed on
+    # `name` so the box actually refreshes when you switch which rubric you're
+    # editing, instead of keeping whatever was typed for a different one.
+    target = active if name == ACTIVE_RUBRIC_NAME else get_rubric(name)
+    task_default = (target or {}).get("task") or grading.DEFAULT_TASK
+    task_text = st.text_area(
+        "Task description (graded against)", value=task_default, height=220, key=f"rubric_task_{name}"
+    )
     up = st.file_uploader("Rubric CSV", type=["csv"])
     if up is not None and st.button("Save rubric", type="primary"):
         try:
             csv_text = up.getvalue().decode("utf-8-sig")
         except UnicodeDecodeError:
             csv_text = up.getvalue().decode("latin-1")
-        ok, err = save_rubric(name.strip() or ACTIVE_RUBRIC_NAME, task_text, csv_text)
+        ok, err = save_rubric(name, task_text, csv_text)
         (st.success if ok else st.error)("Saved." if ok else f"Not saved: {err}")
         st.rerun()
 
