@@ -111,7 +111,8 @@ def _run_hidden_grading(subject_id: str, notebook_text: str) -> None:
         return
     try:
         results = grading.grade_notebook(
-            get_client(), rubric["task"], rubric["rubric_csv"], notebook_text
+            get_client(), rubric["task"], rubric["rubric_csv"], notebook_text,
+            instructions=rubric.get("grading_instructions"),
         )
         total = round(sum(r["score"] for r in results), 2)
         mx = round(sum(r["max_pts"] for r in results), 2)

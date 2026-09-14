@@ -48,24 +48,13 @@ is part of the task). The brief:
 """
 
 
-def build_system_prompt(task: str, rubric_csv: str) -> str:
-    """The grader's system message: study context, the rubric CSV verbatim, and the
-    grading rules. The CSV is embedded as uploaded — never reparsed or transformed."""
-    return f"""You are an expert data-science instructor grading Jupyter notebooks \
-from a research study, strictly and consistently against a fixed rubric.
-
-
-## Study context
-{task}
-
-
-## Rubric (the exact CSV the grader uploaded)
-```csv
-{rubric_csv}
-```
-
-
-## Grading rules
+# The default "how to grade" instructions -- the one piece of the system prompt
+# an admin can override (per rubric, via a .md upload in the Grading tab). Study
+# context and the rubric CSV are always assembled around it in build_system_prompt;
+# the JSON output-shape instruction always stays appended, since the model needs
+# to be told the shape even though the API also structurally enforces it via
+# output_format=GradeResult.
+DEFAULT_GRADING_INSTRUCTIONS = """\
 - Score every scoreable rubric item (row) from 0 to that item's maximum points,
   reading every column of the CSV — point values and any full/partial/low-credit
   guidance — as written.
@@ -83,7 +72,30 @@ from a research study, strictly and consistently against a fixed rubric.
   ran and produced a figure, and judge the figure's purpose from the code.
 - An empty or near-empty notebook should receive 0s with a brief explanation.
 - Be consistent: the same evidence must always earn the same score.
-- Reasoning: 1-3 concrete sentences referencing cell numbers.
+- Reasoning: 1-3 concrete sentences referencing cell numbers."""
+
+
+def build_system_prompt(task: str, rubric_csv: str, instructions: str | None = None) -> str:
+    """The grader's system message: study context, the rubric CSV verbatim, the
+    grading instructions (admin-overridable, defaults to DEFAULT_GRADING_INSTRUCTIONS),
+    and the output format. The CSV is embedded as uploaded — never reparsed or
+    transformed."""
+    return f"""You are an expert data-science instructor grading Jupyter notebooks \
+from a research study, strictly and consistently against a fixed rubric.
+
+
+## Study context
+{task}
+
+
+## Rubric (the exact CSV the grader uploaded)
+```csv
+{rubric_csv}
+```
+
+
+## Grading rules
+{instructions or DEFAULT_GRADING_INSTRUCTIONS}
 
 ## Output format
 Respond with ONLY a JSON object (no markdown code fences, no commentary), exactly
@@ -107,11 +119,14 @@ class GradeResult(BaseModel):
 
 
 def grade_notebook(
-    client: Anthropic, task: str, rubric_csv: str, notebook_text: str
+    client: Anthropic, task: str, rubric_csv: str, notebook_text: str,
+    instructions: str | None = None,
 ) -> list[dict]:
     """Score one notebook against the rubric CSV. The CSV text is given to the model
     exactly as uploaded; the model reads it and returns one score + reasoning per
-    rubric item. Returns [{"section","criterion","max_pts","score","reasoning"}]."""
+    rubric item. `instructions` overrides the default "how to grade" rules (see
+    build_system_prompt) when the rubric has its own. Returns
+    [{"section","criterion","max_pts","score","reasoning"}]."""
     user_content = (
         "Grade the following notebook.\n\n"
         f"===== BEGIN NOTEBOOK TRANSCRIPT =====\n{notebook_text}\n"
@@ -126,7 +141,7 @@ def grade_notebook(
             timeout=600.0,
             system=[{
                 "type": "text",
-                "text": build_system_prompt(task, rubric_csv),
+                "text": build_system_prompt(task, rubric_csv, instructions),
                 "cache_control": {"type": "ephemeral"},
             }],
             messages=[{"role": "user", "content": user_content}],

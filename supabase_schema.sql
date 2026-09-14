@@ -86,6 +86,9 @@ create table if not exists grading_rubric (
   name text primary key,
   task text not null,
   rubric_csv text not null,   -- the uploaded CSV, verbatim
+  grading_instructions text,  -- "how to grade" override, handed to Opus 5 verbatim
+                               -- in place of lib.grading.DEFAULT_GRADING_INSTRUCTIONS;
+                               -- NULL/empty means use the default
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -287,6 +290,11 @@ where t.subject_id = pl.subject_id and t.source = 'log' and t.log_filename = '';
 alter table participant_turn_annotations drop constraint if exists participant_turn_annotations_pkey;
 alter table participant_turn_annotations
   add primary key (subject_id, source, log_filename, turn_index);
+
+-- Per-rubric override of the "how to grade" instructions handed to Opus 5
+-- (previously hardcoded in lib.grading.build_system_prompt). NULL/empty means
+-- fall back to lib.grading.DEFAULT_GRADING_INSTRUCTIONS.
+alter table grading_rubric add column if not exists grading_instructions text;
 
 -- PostgREST caches the schema and answers from that cache; this makes the new
 -- column visible immediately instead of waiting for its own reload.

@@ -200,8 +200,13 @@ def save_model_followup(
 # Notebook grading
 # ---------------------------------------------------------------------------
 
-def save_rubric(name: str, task: str, rubric_csv: str) -> tuple[bool, str | None]:
-    """Upsert a rubric (task + the raw uploaded CSV) by name. Returns (success, error)."""
+def save_rubric(
+    name: str, task: str, rubric_csv: str, grading_instructions: str | None = None
+) -> tuple[bool, str | None]:
+    """Upsert a rubric (task + the raw uploaded CSV + optional grading-instructions
+    override) by name. Returns (success, error). `grading_instructions` is the
+    "how to grade" text handed to the model in place of
+    lib.grading.DEFAULT_GRADING_INSTRUCTIONS -- None/'' means use the default."""
     client = get_supabase_client()
     if client is None:
         return False, "Database not configured (SUPABASE_URL/SUPABASE_KEY not set)."
@@ -211,6 +216,7 @@ def save_rubric(name: str, task: str, rubric_csv: str) -> tuple[bool, str | None
                 "name": name,
                 "task": task,
                 "rubric_csv": rubric_csv,
+                "grading_instructions": grading_instructions or None,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
             on_conflict="name",
@@ -228,7 +234,7 @@ def get_rubric(name: str) -> dict | None:
     try:
         resp = (
             client.table("grading_rubric")
-            .select("name,task,rubric_csv,updated_at")
+            .select("name,task,rubric_csv,grading_instructions,updated_at")
             .eq("name", name)
             .limit(1)
             .execute()

@@ -107,7 +107,8 @@ def _grade_one(subject_id: str, notebook_text: str, rubric_name: str) -> tuple[b
         return False, f"No usable rubric '{rubric_name}'."
     try:
         results = grading.grade_notebook(
-            get_client(), rubric["task"], rubric["rubric_csv"], notebook_text
+            get_client(), rubric["task"], rubric["rubric_csv"], notebook_text,
+            instructions=rubric.get("grading_instructions"),
         )
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
@@ -725,6 +726,10 @@ with tab_grading:
             )
             with st.expander("Task description"):
                 st.markdown(viewed.get("task") or "_(empty)_")
+            with st.expander("Grading instructions (the \"how to grade\" prompt sent to Opus 5)"):
+                st.markdown(viewed.get("grading_instructions") or grading.DEFAULT_GRADING_INSTRUCTIONS)
+                if not viewed.get("grading_instructions"):
+                    st.caption("(using the built-in default — not customized for this rubric)")
             try:
                 st.dataframe(
                     pd.read_csv(io.StringIO(viewed["rubric_csv"])), hide_index=True, width="stretch"
@@ -748,28 +753,41 @@ with tab_grading:
     # editing, instead of keeping whatever was typed for a different one.
     target = active if name == ACTIVE_RUBRIC_NAME else get_rubric(name)
     task_default = (target or {}).get("task") or grading.DEFAULT_TASK
-    _task_key = f"rubric_task_{name}"
-    task_md = st.file_uploader(
-        "Or upload the task description as a .md file — fills in the box below",
-        type=["md"], key=f"task_md_up_{name}",
-    )
-    if task_md is not None:
-        # Only overwrite on a genuinely new upload, not every rerun -- otherwise
-        # this would stomp on manual edits made to the box afterward.
-        _applied_key = f"_task_md_applied_{name}"
-        if st.session_state.get(_applied_key) != task_md.name:
-            st.session_state[_task_key] = _decode_upload(task_md)
-            st.session_state[_applied_key] = task_md.name
     task_text = st.text_area(
-        "Task description (graded against)", value=task_default, height=220, key=_task_key
+        "Task description (graded against)", value=task_default, height=220,
+        key=f"rubric_task_{name}",
     )
+
+    st.markdown("###### Grading instructions")
+    st.caption(
+        "The \"how to grade\" prompt sent directly to Opus 5 — scoring scale, what "
+        "counts as evidence, etc. Separate from the task description above."
+    )
+    instructions_default = (target or {}).get("grading_instructions") or grading.DEFAULT_GRADING_INSTRUCTIONS
+    _instr_key = f"rubric_instructions_{name}"
+    instructions_md = st.file_uploader(
+        "Upload the grading instructions as a .md file — fills in the box below",
+        type=["md"], key=f"instructions_md_up_{name}",
+    )
+    if instructions_md is not None:
+        # Only overwrite on a genuinely new upload, not every rerun -- otherwise
+        # this would stomp on a manual edit made to the box afterward.
+        _applied_key = f"_instructions_md_applied_{name}"
+        if st.session_state.get(_applied_key) != instructions_md.name:
+            st.session_state[_instr_key] = _decode_upload(instructions_md)
+            st.session_state[_applied_key] = instructions_md.name
+    instructions_text = st.text_area(
+        "Grading instructions", value=instructions_default, height=220, key=_instr_key,
+        label_visibility="collapsed",
+    )
+
     up = st.file_uploader("Rubric CSV", type=["csv"])
     if up is not None and st.button("Save rubric", type="primary"):
         try:
             csv_text = up.getvalue().decode("utf-8-sig")
         except UnicodeDecodeError:
             csv_text = up.getvalue().decode("latin-1")
-        ok, err = save_rubric(name, task_text, csv_text)
+        ok, err = save_rubric(name, task_text, csv_text, instructions_text)
         st.session_state["_rubric_save_msg"] = (
             ok, f"Saved `{name}` ({len(csv_text.splitlines())} CSV line(s))." if ok
             else f"Not saved: {err}"
