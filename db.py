@@ -228,7 +228,7 @@ def get_rubric(name: str) -> dict | None:
     try:
         resp = (
             client.table("grading_rubric")
-            .select("name,task,rubric_csv")
+            .select("name,task,rubric_csv,updated_at")
             .eq("name", name)
             .limit(1)
             .execute()
