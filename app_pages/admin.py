@@ -748,8 +748,20 @@ with tab_grading:
     # editing, instead of keeping whatever was typed for a different one.
     target = active if name == ACTIVE_RUBRIC_NAME else get_rubric(name)
     task_default = (target or {}).get("task") or grading.DEFAULT_TASK
+    _task_key = f"rubric_task_{name}"
+    task_md = st.file_uploader(
+        "Or upload the task description as a .md file — fills in the box below",
+        type=["md"], key=f"task_md_up_{name}",
+    )
+    if task_md is not None:
+        # Only overwrite on a genuinely new upload, not every rerun -- otherwise
+        # this would stomp on manual edits made to the box afterward.
+        _applied_key = f"_task_md_applied_{name}"
+        if st.session_state.get(_applied_key) != task_md.name:
+            st.session_state[_task_key] = _decode_upload(task_md)
+            st.session_state[_applied_key] = task_md.name
     task_text = st.text_area(
-        "Task description (graded against)", value=task_default, height=220, key=f"rubric_task_{name}"
+        "Task description (graded against)", value=task_default, height=220, key=_task_key
     )
     up = st.file_uploader("Rubric CSV", type=["csv"])
     if up is not None and st.button("Save rubric", type="primary"):
