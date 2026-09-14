@@ -724,19 +724,29 @@ def list_participant_logs_raw() -> list[dict]:
 
 
 def list_participant_transcripts_raw() -> list[dict]:
-    """[{subject_id, filename, parsed}] — for bulk-annotating verbal-assessment
-    transcripts. `parsed` is [{"timestamp","question","answer"}, ...] or None if
-    the transcript was uploaded but never parsed."""
+    """[{subject_id, filename, parsed, notebook_text}] — for bulk fact-checking
+    verbal-assessment transcripts against each participant's own notebook.
+    `parsed` is [{"timestamp","question","answer"}, ...] or None if the transcript
+    was uploaded but never parsed. `notebook_text` is None if no notebook is on
+    file for that participant yet (nothing to check the answer against)."""
     client = get_supabase_client()
     if client is None:
         return []
     try:
-        return (
+        rows = (
             client.table("participant_transcripts")
             .select("subject_id,filename,parsed").execute().data or []
         )
+        notebooks = {
+            r["subject_id"]: r.get("notebook_text")
+            for r in (client.table("participant_notebooks")
+                      .select("subject_id,notebook_text").execute().data or [])
+        }
     except Exception:
         return []
+    for r in rows:
+        r["notebook_text"] = notebooks.get(r["subject_id"])
+    return rows
 
 
 def save_turn_annotations(

@@ -1,12 +1,15 @@
-"""Auto-annotate participant turns: one LLM call per turn, tagging the kind of
-behaviour happening, for the delegation-conditions study.
+"""Auto-annotate participant turns: one LLM call per turn, for the
+delegation-conditions study. Two sources, two different taxonomies:
 
-Two sources feed this:
   - a session log's User Prompt events (`lib.timeline.parse_jsonl` output) — one
-    call per prompt, with same-turn Agent Call / Tool Call text as context when the
-    log format has it ("transcript" format; "history" format has no context at all).
+    call per prompt, tagging the *behaviour* (phase / delegation posture / trust),
+    with same-turn Agent Call / Tool Call text as context when the log format has
+    it ("transcript" format; "history" format has no context at all).
   - a verbal-assessment transcript's Q/A pairs (`lib.transcript.parse_transcript`
-    output) — one call per pair, the answer itself is the context.
+    output) — the participant answering interview questions about the notebook
+    task *after the fact*. There's no delegation happening here; what matters is
+    whether the spoken answer is *truthful to the participant's own notebook* —
+    one call per pair, checked against the notebook text (ground truth).
 
 Tags are constrained enums (Pydantic `Literal`s), so `client.messages.parse`
 validates structure for us — no self-check/repair loop needed, unlike quiz.py's
@@ -125,17 +128,89 @@ def annotate_log(
     return out
 
 
+_TRANSCRIPT_SYSTEM = (
+    "You fact-check one answer from a verbal assessment given right after a "
+    "take-home data-science task. The interviewer asked the participant questions "
+    "about the task; you're given the participant's own notebook as ground truth. "
+    "Judge whether the spoken answer is truthful to what the notebook actually "
+    "shows — not whether the answer is a *good* approach, just whether it "
+    "accurately describes what the participant actually did.\n\n"
+    "Tag accuracy:\n"
+    "- accurate: the answer's factual claims match what the notebook shows.\n"
+    "- partially_accurate: some claims match; others are vague, overstated, or "
+    "slightly off from what the notebook actually contains.\n"
+    "- inaccurate: the answer contradicts or fabricates something the notebook "
+    "does not show (e.g. describing a method, metric, or step that isn't there).\n"
+    "- unverifiable: the question is conceptual/opinion-based (e.g. \"what would "
+    "you do differently\") and isn't a claim about the notebook's contents at all.\n\n"
+    "Write one short sentence of reasoning citing the specific notebook content "
+    "(or its absence) that the verdict rests on."
+)
+
+_TRANSCRIPT_INSTRUCTIONS = """\
+QUESTION: %s
+
+PARTICIPANT'S ANSWER: %s
+
+THEIR NOTEBOOK (ground truth):
+%s
+"""
+
+
+class TranscriptAnswerAnnotation(BaseModel):
+    accuracy: Literal["accurate", "partially_accurate", "inaccurate", "unverifiable"]
+    reasoning: str
+
+
+def annotate_transcript_answer(
+    client: Anthropic, question: str, answer: str, notebook_text: str
+) -> TranscriptAnswerAnnotation:
+    """One LLM call, checking one verbal-assessment answer against the
+    participant's own notebook. Same error contract as annotate_turn."""
+    try:
+        response = client.messages.parse(
+            model=MODEL,
+            max_tokens=1024,
+            timeout=600.0,
+            system=_TRANSCRIPT_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": _TRANSCRIPT_INSTRUCTIONS % (
+                    question or "(empty)", answer or "(no answer given)",
+                    notebook_text or "(no notebook on file)",
+                ),
+            }],
+            output_format=TranscriptAnswerAnnotation,
+        )
+    except ValidationError as e:
+        raise RuntimeError(f"The model returned a malformed response: {e} — try again.") from e
+    if response.stop_reason == "refusal":
+        detail = getattr(response.stop_details, "explanation", None) or "safety refusal"
+        raise RuntimeError(f"The model declined to check this answer ({detail}).")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("The model ran out of room before finishing — try again.")
+    parsed = response.parsed_output
+    if parsed is None:
+        raise RuntimeError("The model returned an unparseable response — try again.")
+    return parsed
+
+
 def annotate_transcript(
-    client: Anthropic, pairs: list[dict], skip_turn_indexes: frozenset[int] = frozenset()
+    client: Anthropic,
+    pairs: list[dict],
+    notebook_text: str,
+    skip_turn_indexes: frozenset[int] = frozenset(),
 ) -> list[dict]:
-    """Tag every not-yet-annotated {timestamp, question, answer} pair from a
-    verbal-assessment transcript (pair list-index in `skip_turn_indexes` is left
-    alone). The answer is the context — real signal, unlike history-format logs."""
+    """Fact-check every not-yet-annotated {timestamp, question, answer} pair from a
+    verbal-assessment transcript against the participant's own notebook (pair
+    list-index in `skip_turn_indexes` is left alone)."""
     out = []
     for i, pair in enumerate(pairs):
         if i in skip_turn_indexes:
             continue
-        tag = annotate_turn(client, pair.get("question", ""), pair.get("answer") or None)
+        tag = annotate_transcript_answer(
+            client, pair.get("question", ""), pair.get("answer", ""), notebook_text
+        )
         out.append({"turn_index": i, "turn_text": pair.get("question", ""), **tag.model_dump()})
     return out
 

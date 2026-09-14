@@ -4,11 +4,12 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Five top-level tabs:
   1. Overview        — one row per participant, filter by condition, CSV export
   2. Participant     — sub-tabs per task/data type: Task plan, Debug (manual vs
                        AI), Ideate (manual vs AI), Notebook grade, Quiz, Verbal
-                       assessment, Session timeline, Raw files. The Verbal
-                       assessment and Session timeline sub-tabs also carry
-                       per-participant turn annotation: an "Annotate" button tags
-                       every not-yet-tagged turn, shown in place as 💬 popovers
-                       (phase / delegation posture / trust behaviour + reasoning).
+                       assessment, Session timeline, Raw files. Session timeline
+                       carries per-turn behaviour tagging (phase / delegation
+                       posture / trust) via an "Annotate" button, shown in place
+                       as 💬 popovers. Verbal assessment carries a "Fact-check"
+                       button instead — it tags each spoken answer's accuracy
+                       against the participant's own notebook, not behaviour.
   3. Cohort stats    — outcomes + behaviour overall and split by condition
   4. Notebook report — the visual grading report across all graded notebooks
   5. Grading         — browse/upload any rubric version, grade or re-grade
@@ -116,11 +117,16 @@ def _annotate_log_for(subject_id: str, raw_jsonl: str) -> tuple[bool, str]:
     return (ok, f"annotated {len(new_annos)} turn(s)" if ok else (err or "save failed"))
 
 
-def _annotate_transcript_for(subject_id: str, pairs: list[dict]) -> tuple[bool, str]:
-    """Tag every not-yet-annotated Q/A pair in one participant's verbal transcript."""
+def _annotate_transcript_for(
+    subject_id: str, pairs: list[dict], notebook_text: str | None
+) -> tuple[bool, str]:
+    """Fact-check every not-yet-annotated Q/A pair in one participant's verbal
+    transcript against their own notebook."""
+    if not notebook_text:
+        return False, "no notebook on file to check the answers against"
     existing = frozenset(annotated_turn_indexes(subject_id, "transcript"))
     try:
-        new_annos = annotate.annotate_transcript(get_client(), pairs, existing)
+        new_annos = annotate.annotate_transcript(get_client(), pairs, notebook_text, existing)
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
     if not new_annos:
@@ -272,17 +278,20 @@ with tab_detail:
             tr = bundle["transcript"]
             if tr:
                 pairs = tr.get("parsed") or []
+                notebook_text = nb.get("notebook_text") if nb else None
                 anno_map = {
                     a["turn_index"]: a for a in list_turn_annotations(sid) if a["source"] == "transcript"
                 }
                 if pairs:
                     n_missing = len(pairs) - len(anno_map)
+                    if not notebook_text:
+                        st.caption("No notebook on file — can't fact-check answers against it yet.")
                     if st.button(
-                        f"🏷️ Annotate ({n_missing} new)" if n_missing else "🏷️ Annotate (up to date)",
-                        key="annotate_tr", disabled=n_missing == 0,
+                        f"🏷️ Fact-check ({n_missing} new)" if n_missing else "🏷️ Fact-check (up to date)",
+                        key="annotate_tr", disabled=n_missing == 0 or not notebook_text,
                     ):
-                        with st.spinner("Annotating…"):
-                            ok, msg = _annotate_transcript_for(sid, pairs)
+                        with st.spinner("Checking answers against the notebook…"):
+                            ok, msg = _annotate_transcript_for(sid, pairs, notebook_text)
                         (st.success if ok else st.error)(msg)
                         st.rerun()
                 for i, pr in enumerate(pairs):
@@ -293,9 +302,7 @@ with tab_detail:
                     a = anno_map.get(i)
                     if a:
                         with c_tag.popover("💬"):
-                            st.caption(
-                                f"**{a['phase']}** · {a['delegation_posture']} · {a['trust_behavior']}"
-                            )
+                            st.caption(f"**{a['accuracy']}**")
                             st.write(a.get("reasoning") or "")
                 if not pairs:
                     st.caption("Uploaded but not parsed — use Re-parse below.")
@@ -562,15 +569,23 @@ with tab_grading:
         if n_missing:
             _pending_logs.append((row, n_missing))
     _pending_trs = []
+    _skipped_trs_no_notebook = 0
     for row in list_participant_transcripts_raw():
         pairs = row.get("parsed") or []
+        if not pairs:
+            continue
+        if not row.get("notebook_text"):
+            _skipped_trs_no_notebook += 1
+            continue
         n_missing = len(pairs) - len(annotated_turn_indexes(row["subject_id"], "transcript"))
-        if pairs and n_missing:
+        if n_missing:
             _pending_trs.append((row, n_missing))
     _total_calls = sum(n for _, n in _pending_logs) + sum(n for _, n in _pending_trs)
     st.caption(
         f"{len(_pending_logs)} log(s) and {len(_pending_trs)} transcript(s) have new "
         f"turns — about {_total_calls} call(s) total."
+        + (f" ({_skipped_trs_no_notebook} transcript(s) skipped — no notebook to "
+           "fact-check against.)" if _skipped_trs_no_notebook else "")
     )
     if _total_calls and st.button(
         f"🏷️ Annotate everything pending ({_total_calls} call(s))", type="primary"
@@ -585,8 +600,10 @@ with tab_grading:
             st.write(f"{'✅' if ok else '⚠️'} {row['subject_id']} (log): {msg}")
         for row, _n in _pending_trs:
             step += 1
-            prog.progress(step / n_steps, text=f"Annotating {row['subject_id']}'s transcript…")
-            ok, msg = _annotate_transcript_for(row["subject_id"], row.get("parsed") or [])
+            prog.progress(step / n_steps, text=f"Fact-checking {row['subject_id']}'s transcript…")
+            ok, msg = _annotate_transcript_for(
+                row["subject_id"], row.get("parsed") or [], row.get("notebook_text")
+            )
             st.write(f"{'✅' if ok else '⚠️'} {row['subject_id']} (transcript): {msg}")
         prog.progress(1.0, text="Done.")
         st.rerun()

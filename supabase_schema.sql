@@ -201,9 +201,11 @@ create table if not exists participant_turn_annotations (
   source text not null,          -- 'log' | 'transcript'
   turn_index int not null,       -- log: the event's `turn` field; transcript: pair list index
   turn_text text not null,       -- snapshot of what was annotated, for audit/display
-  phase text,                    -- planning | implementing | debugging | verifying | reflecting
-  delegation_posture text,       -- high_level_ask | step_by_step | clarifying_question
-  trust_behavior text,           -- accepts_unreviewed | reviews_edits | rejects_redirects | insufficient_context
+  phase text,                    -- source='log' only: planning | implementing | debugging | verifying | reflecting
+  delegation_posture text,       -- source='log' only: high_level_ask | step_by_step | clarifying_question
+  trust_behavior text,           -- source='log' only: accepts_unreviewed | reviews_edits | rejects_redirects | insufficient_context
+  accuracy text,                 -- source='transcript' only: accurate | partially_accurate | inaccurate | unverifiable
+                                  -- (does the participant's spoken answer match what their notebook actually shows)
   reasoning text,                -- short model-written justification
   model text not null,
   created_at timestamptz not null default now(),
@@ -254,6 +256,11 @@ end $$;
 -- data. Run it only after re-saving your rubrics; nothing in the app reads these.
 -- alter table grading_rubric drop column if exists items,
 --                            drop column if exists total_points;
+
+-- participant_turn_annotations was created before the transcript-accuracy taxonomy
+-- (checking the participant's spoken answer against their own notebook) was split
+-- out from the log-behaviour taxonomy (phase/delegation_posture/trust_behavior).
+alter table participant_turn_annotations add column if not exists accuracy text;
 
 -- PostgREST caches the schema and answers from that cache; this makes the new
 -- column visible immediately instead of waiting for its own reload.
