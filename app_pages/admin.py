@@ -334,23 +334,26 @@ with tab_detail:
                             ok, msg = _annotate_transcript_for(sid, pairs, notebook_text, force=force_tr)
                         (st.success if ok else st.error)(msg)
                         st.rerun()
+                _ACCURACY_ICON = {
+                    "accurate": "✅", "partially_accurate": "⚠️",
+                    "inaccurate": "❌", "unverifiable": "❔",
+                }
                 for i, pr in enumerate(pairs):
-                    c_qa, c_tag = st.columns([6, 1])
-                    with c_qa:
-                        st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
-                        st.markdown(pr.get("answer") or "_(no answer)_")
+                    st.markdown(f"**`{pr.get('timestamp', '')}` · {pr.get('question', '')}**")
+                    st.markdown(pr.get("answer") or "_(no answer)_")
                     a = anno_map.get(i)
                     if a:
-                        with c_tag.popover("💬"):
-                            st.caption(f"**{a['accuracy']}**")
-                            st.write(a.get("reasoning") or "")
-                            if st.button("🔄 Re-check this answer", key=f"reanno_tr_{i}"):
-                                with st.spinner("Re-checking…"):
-                                    ok, msg = _reannotate_one_transcript_pair(
-                                        sid, pairs, notebook_text, i
-                                    )
-                                (st.success if ok else st.error)(msg)
-                                st.rerun()
+                        icon = _ACCURACY_ICON.get(a["accuracy"], "🏷️")
+                        label = a["accuracy"].replace("_", " ").title()
+                        st.caption(f"{icon} **{label}** — {a.get('reasoning') or ''}")
+                        if st.button("🔄 Re-check this answer", key=f"reanno_tr_{i}"):
+                            with st.spinner("Re-checking…"):
+                                ok, msg = _reannotate_one_transcript_pair(
+                                    sid, pairs, notebook_text, i
+                                )
+                            (st.success if ok else st.error)(msg)
+                            st.rerun()
+                    st.divider()
                 if not pairs:
                     st.caption("Uploaded but not parsed — use Re-parse below.")
                 with st.expander("Raw transcript"):
