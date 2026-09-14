@@ -7,7 +7,8 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Five top-level tabs:
                        assessment, Session timeline, Raw files
   3. Cohort stats    — outcomes + behaviour overall and split by condition
   4. Notebook report — the visual grading report across all graded notebooks
-  5. Grading         — the active rubric + "grade all pending"
+  5. Grading         — browse/upload any rubric version, grade or re-grade
+                       (individually or in bulk) against whichever one you pick
 
 One page of the multipage app — run via `streamlit run app.py`.
 """
@@ -70,12 +71,12 @@ if not st.session_state.get("admin_ok"):
     st.stop()
 
 
-def _grade_one(subject_id: str, notebook_text: str) -> tuple[bool, str]:
-    """Grade one participant's notebook against the active rubric. Returns (ok, msg)."""
-    rubric = get_rubric(ACTIVE_RUBRIC_NAME)
+def _grade_one(subject_id: str, notebook_text: str, rubric_name: str) -> tuple[bool, str]:
+    """Grade one participant's notebook against the named rubric. Returns (ok, msg)."""
+    rubric = get_rubric(rubric_name)
     if rubric is None or not (rubric.get("rubric_csv") or "").strip():
-        set_participant_grading_error(subject_id, f"No usable rubric '{ACTIVE_RUBRIC_NAME}'.")
-        return False, f"No usable rubric '{ACTIVE_RUBRIC_NAME}'."
+        set_participant_grading_error(subject_id, f"No usable rubric '{rubric_name}'.")
+        return False, f"No usable rubric '{rubric_name}'."
     try:
         results = grading.grade_notebook(
             get_client(), rubric["task"], rubric["rubric_csv"], notebook_text
@@ -87,7 +88,7 @@ def _grade_one(subject_id: str, notebook_text: str) -> tuple[bool, str]:
     total = round(sum(r["score"] for r in results), 2)
     mx = round(sum(r["max_pts"] for r in results), 2)
     ok, err = update_participant_grading(
-        subject_id, ACTIVE_RUBRIC_NAME, grading.MODEL, results, total, mx
+        subject_id, rubric_name, grading.MODEL, results, total, mx
     )
     return (ok, "graded" if ok else (err or "save failed"))
 
@@ -98,6 +99,16 @@ tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
 )
 
 _section_rows = list_notebook_section_scores()  # (participant, section) grades; used in tabs 2 & 3
+_all_rubric_names = list_rubrics()  # every saved rubric version; used in tabs 2 & 5
+_rubric_options = _all_rubric_names or [ACTIVE_RUBRIC_NAME]
+
+
+def _rubric_index(preferred: str | None) -> int:
+    """Index of `preferred` in _rubric_options, falling back to ACTIVE_RUBRIC_NAME, then 0."""
+    for candidate in (preferred, ACTIVE_RUBRIC_NAME):
+        if candidate in _rubric_options:
+            return _rubric_options.index(candidate)
+    return 0
 
 # ---- Tab 1: Overview ----------------------------------------------------
 with tab_overview:
@@ -178,6 +189,7 @@ with tab_detail:
                     + (f"  ({100 * nb['total_score'] / nb['max_score']:.0f}%)"
                        if nb.get("max_score") else ""),
                 )
+                st.caption(f"Graded against rubric `{nb.get('rubric_name', '?')}`.")
                 cohort.render_participant_notebook_sections(nb["results"], _section_rows, sid)
                 with st.expander("Per-criterion detail"):
                     gdf = pd.DataFrame(nb["results"])[
@@ -187,16 +199,25 @@ with tab_detail:
                 if nb.get("notebook_text"):
                     with st.expander("Notebook transcript (as graded)"):
                         st.code(nb["notebook_text"])
-                if st.button("Re-grade with current rubric", key="regrade_detail"):
-                    with st.spinner("Grading…"):
-                        ok, msg = _grade_one(sid, nb["notebook_text"])
+                c_pick, c_go = st.columns([3, 1])
+                pick = c_pick.selectbox(
+                    "Re-grade against", _rubric_options,
+                    index=_rubric_index(nb.get("rubric_name")), key="regrade_rubric_pick",
+                )
+                if c_go.button("Re-grade", key="regrade_detail"):
+                    with st.spinner(f"Grading against `{pick}`…"):
+                        ok, msg = _grade_one(sid, nb["notebook_text"], pick)
                     (st.success if ok else st.error)(msg)
                     st.rerun()
             elif nb:
                 st.caption("Notebook stored but not graded yet.")
+                pick = st.selectbox(
+                    "Grade against", _rubric_options,
+                    index=_rubric_index(None), key="grade_now_rubric_pick",
+                )
                 if st.button("Grade now", key="grade_now_detail"):
-                    with st.spinner("Grading…"):
-                        ok, msg = _grade_one(sid, nb["notebook_text"])
+                    with st.spinner(f"Grading against `{pick}`…"):
+                        ok, msg = _grade_one(sid, nb["notebook_text"], pick)
                     (st.success if ok else st.error)(msg)
                     st.rerun()
                 if nb.get("notebook_text"):
@@ -319,8 +340,9 @@ with tab_report:
 # ---- Tab 5: Grading & rubric ----------------------------------------
 with tab_grading:
     st.markdown(
-        f"Hidden-synchronous grading uses the rubric named **`{ACTIVE_RUBRIC_NAME}`** "
-        "(override with the `ACTIVE_RUBRIC_NAME` secret)."
+        f"New submissions are auto-graded against the rubric named **`{ACTIVE_RUBRIC_NAME}`** "
+        "(override with the `ACTIVE_RUBRIC_NAME` secret). Every saved rubric version stays "
+        "on file below — browse any of them, and (re-)grade against whichever one you pick."
     )
     # The save button below calls st.rerun() right after saving — without this,
     # the success/error message it shows gets wiped before it ever renders, so
@@ -342,11 +364,38 @@ with tab_grading:
             "stay ungraded until you upload one below and re-grade them."
         )
 
+    st.markdown("#### Browse saved rubrics")
+    if not _all_rubric_names:
+        st.caption("No rubrics saved yet.")
+    else:
+        view_pick = st.selectbox(
+            "Rubric version", _rubric_options, index=_rubric_index(None), key="view_rubric_pick",
+        )
+        viewed = active if view_pick == ACTIVE_RUBRIC_NAME else get_rubric(view_pick)
+        if viewed and (viewed.get("rubric_csv") or "").strip():
+            _vupd = viewed.get("updated_at")
+            st.caption(
+                f"`{view_pick}`" + (" · **active**" if view_pick == ACTIVE_RUBRIC_NAME else "")
+                + (f" · last saved {_vupd}" if _vupd else "")
+            )
+            with st.expander("Task description"):
+                st.markdown(viewed.get("task") or "_(empty)_")
+            try:
+                st.dataframe(
+                    pd.read_csv(io.StringIO(viewed["rubric_csv"])), hide_index=True, width="stretch"
+                )
+            except Exception:
+                st.code(viewed["rubric_csv"], language="csv")
+        else:
+            st.caption(f"`{view_pick}` has no usable CSV.")
+
     st.markdown("#### Upload / replace a rubric")
-    existing = list_rubrics()
-    if existing:
-        st.caption("Saved rubrics: " + ", ".join(f"`{r}`" for r in existing))
-    name = st.text_input("Rubric name", value=ACTIVE_RUBRIC_NAME)
+    if _all_rubric_names:
+        st.caption("Saved rubrics: " + ", ".join(f"`{r}`" for r in _all_rubric_names))
+    name = st.text_input(
+        "Rubric name — an existing name replaces that version; a new name adds one",
+        value=ACTIVE_RUBRIC_NAME,
+    )
     name = name.strip() or ACTIVE_RUBRIC_NAME
     # Look up whatever's already stored under this name so "replace" doesn't
     # silently blank a customised task back to the generic template. Keyed on
@@ -370,27 +419,24 @@ with tab_grading:
         )
         st.rerun()
 
-    if active and (active.get("rubric_csv") or "").strip():
-        try:
-            st.dataframe(pd.read_csv(io.StringIO(active["rubric_csv"])), hide_index=True, width="stretch")
-        except Exception:
-            st.code(active["rubric_csv"], language="csv")
-
     st.divider()
-    st.markdown("#### Grade pending participants")
+    st.markdown("#### Grade participants")
+    grade_pick = st.selectbox(
+        "Grade against", _rubric_options, index=_rubric_index(None), key="bulk_grade_rubric_pick",
+    )
     regrade_all = st.checkbox(
-        "Include already-graded notebooks (re-grade everyone against the rubric above)"
+        f"Include already-graded notebooks (re-grade everyone against `{grade_pick}`)"
     )
     pending = list_pending_grading(include_graded=regrade_all)
     st.caption(
         f"{len(pending)} participant notebook(s) "
         + ("on file." if regrade_all else "pending or errored.")
     )
-    if pending and st.button(f"Grade {len(pending)} notebook(s)", type="primary"):
+    if pending and st.button(f"Grade {len(pending)} notebook(s) against `{grade_pick}`", type="primary"):
         prog = st.progress(0.0, text="Starting…")
         for i, row in enumerate(pending):
             prog.progress(i / len(pending), text=f"Grading {row['subject_id']}…")
-            ok, msg = _grade_one(row["subject_id"], row["notebook_text"])
+            ok, msg = _grade_one(row["subject_id"], row["notebook_text"], grade_pick)
             st.write(f"{'✅' if ok else '⚠️'} {row['subject_id']}: {msg}")
         prog.progress(1.0, text="Done.")
         st.rerun()
