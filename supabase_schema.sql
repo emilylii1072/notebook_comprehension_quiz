@@ -245,6 +245,56 @@ alter table participant_turn_annotations enable row level security;
 
 
 -- ---------------------------------------------------------------------------
+-- Admin-authored task instructions, shown to the participant during the study.
+-- One row per task screen: the three condition-specific main tasks plus the
+-- shared ideation and debugging tasks. Uploaded/edited in Admin > Task
+-- instructions; see lib/tasks.py for the task_key vocabulary.
+
+create table if not exists task_instructions (
+  task_key text primary key,        -- main_slow_planning | main_slow_iterating | main_control | ideate | debug
+  title text,
+  content text not null,            -- markdown, rendered verbatim to the participant
+  updated_at timestamptz not null default now()
+);
+
+alter table task_instructions enable row level security;
+
+-- When each timed task was started and finished. started_at is written once, on
+-- the participant's first "Start", and never moved -- that is what lets the
+-- countdown survive a page refresh instead of restarting. limit_seconds is the
+-- allowance (2400 main / 900 debug, null for the untimed ideation task); going
+-- over it is recorded, not prevented.
+
+create table if not exists participant_task_timings (
+  subject_id text not null references participants (subject_id) on delete cascade,
+  task_key text not null,           -- 'main' | 'ideate' | 'debug'
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  limit_seconds integer,
+  primary key (subject_id, task_key)
+);
+
+alter table participant_task_timings enable row level security;
+
+-- Anything extra the participant attaches to the main task beyond the required
+-- plan and notebook (scratch scripts, figures, exports). Keyed by filename, so
+-- there can be any number of them. Text files are stored verbatim; anything
+-- that isn't valid UTF-8 is base64'd, which `encoding` records.
+
+create table if not exists participant_extra_files (
+  subject_id text not null references participants (subject_id) on delete cascade,
+  filename text not null,
+  content text not null,
+  encoding text not null default 'utf-8',   -- 'utf-8' | 'base64'
+  byte_size integer,
+  uploaded_at timestamptz not null default now(),
+  primary key (subject_id, filename)
+);
+
+alter table participant_extra_files enable row level security;
+
+
+-- ---------------------------------------------------------------------------
 -- Migrations for databases created from an earlier version of this file
 -- ---------------------------------------------------------------------------
 -- `create table if not exists` skips a table that already exists, so the blocks
@@ -314,3 +364,17 @@ alter table grading_rubric add column if not exists grading_instructions text;
 -- PostgREST caches the schema and answers from that cache; this makes the new
 -- column visible immediately instead of waiting for its own reload.
 notify pgrst, 'reload schema';
+
+-- The study is now one continuous run (pre-survey -> main task -> ideation ->
+-- quiz -> interview -> debugging -> log -> post-survey) rather than two parts,
+-- so a participant resumes at the exact screen they left rather than at one of
+-- three coarse statuses. `stage` holds that screen's key; `status` is kept in
+-- step with it for the Admin overview and existing filters.
+alter table participants add column if not exists stage text;
+
+-- participant_files.doc_type used to be one of five reflection docs
+-- (task_plan | debug_manual | debug_ai | ideate_manual | ideate_ai). New
+-- submissions write task_plan | ideate | debug instead -- one document per task,
+-- no manual/AI split. No migration is needed or wanted: the column is free text,
+-- and participants collected under the old protocol keep their split documents,
+-- which Admin still displays.

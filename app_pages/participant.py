@@ -1,14 +1,28 @@
 """Participant intake — the only participant-facing page.
 
-Two-part flow, both keyed to the same subject ID:
+One continuous run, keyed to the subject ID entered at the start. The stage the
+participant is on is written to `participants.stage` as they go, so re-entering
+the same ID resumes exactly where they left off rather than at a coarse
+checkpoint:
 
-  Part 1 (right after the coding task): a pre-survey (lib/surveys.py,
-    transcribed from the study's Qualtrics PDF), then upload the notebook and
-    take the comprehension quiz. The notebook is graded synchronously behind
-    the scenes. The pre-survey, notebook, and quiz result are stored.
-  Part 2 (any time later): re-enter the subject ID, upload the five reflection
-    documents and the Claude Code session log, then a post-survey. The
-    notebook is NOT re-uploaded.
+    identify        subject ID + assigned condition
+    pre_survey      lib/surveys.py PRE_SURVEY_ITEMS
+    main_task       the condition's task document, then a 40-minute countdown
+    main_upload     plan + notebook (exact names) + any extra files
+    ideate_task     the ideation document, untimed but measured
+    ideate_upload   one ideation markdown document
+    quiz            the notebook comprehension MCQ
+    interview       hand-off screen; the interview happens away from the app
+    debug_task      the debugging document, then a 15-minute countdown
+    debug_upload    one debugging markdown document
+    log_upload      the Claude Code session log
+    post_survey     lib/surveys.py POST_SURVEY_ITEMS
+    complete        hidden grading runs here, then done
+
+Task instructions are admin-authored (Admin > Task instructions). Timers are
+advisory: the countdown beeps and says time is up, but nothing locks -- see
+lib/tasks.render_countdown. Timing is anchored to a stored started_at, so a
+refresh doesn't hand anyone a fresh allowance.
 
 No score, breakdown, or grading error is ever shown to the participant — all of
 that lives behind the admin gate.
@@ -23,21 +37,25 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from db import (
+    finish_participant_task,
     get_participant,
-    get_participant_bundle,
     get_participant_survey,
+    get_participant_task_timing,
     get_rubric,
     get_secret,
+    get_task_instruction,
     mark_participant_complete,
-    mark_participant_stage1_done,
+    save_participant_extra_file,
     save_participant_file,
     save_participant_log,
     save_participant_notebook,
     set_participant_grading_error,
+    set_participant_stage,
+    start_participant_task,
     update_participant_grading,
     upsert_participant,
 )
-from lib import grading
+from lib import grading, tasks
 from lib.llm import get_client
 from lib.notebook import notebook_to_text
 from lib.quiz_ui import render_quiz_flow
@@ -66,18 +84,42 @@ CONDITION_LABEL = {
     "control": "Control",
 }
 
-# doc_type -> filename suffix (the five Part 2 markdown documents)
+# The run, in order. `status` is what the Admin overview filters on; it moves
+# from in_progress to quiz_done at the MCQ and to complete at the end, matching
+# what those values have always meant.
+STAGES = [
+    "pre_survey", "main_task", "main_upload", "ideate_task", "ideate_upload",
+    "quiz", "interview", "debug_task", "debug_upload", "log_upload",
+    "post_survey", "complete",
+]
+STAGE_STATUS = {"complete": "complete"}
+
+# Progress labels — the participant sees how far along they are, never a score.
+STAGE_STEP = {
+    "pre_survey": ("Opening survey", 1),
+    "main_task": ("Main task", 2), "main_upload": ("Main task", 2),
+    "ideate_task": ("Idea generation", 3), "ideate_upload": ("Idea generation", 3),
+    "quiz": ("Questions about your notebook", 4),
+    "interview": ("Interview", 5),
+    "debug_task": ("Debugging", 6), "debug_upload": ("Debugging", 6),
+    "log_upload": ("Session log", 7),
+    "post_survey": ("Closing survey", 8),
+}
+N_STEPS = 8
+
+# doc_type -> filename suffix. One document per task now: the manual/AI split
+# (debug_manual / debug_ai / ideate_manual / ideate_ai) belonged to an earlier
+# protocol and is no longer collected, though Admin still shows it for
+# participants who were run under it.
 DOC_SUFFIXES = {
     "task_plan": "task_plan.md",
-    "debug_manual": "debug_manual.md",
-    "debug_ai": "debug_ai.md",
-    "ideate_manual": "ideate_manual.md",
-    "ideate_ai": "ideate_ai.md",
+    "ideate": "ideate.md",
+    "debug": "debug.md",
 }
 DOC_TITLES = {
     "task_plan": "Task plan",
-    "debug_manual": "Debug — manual", "debug_ai": "Debug — AI",
-    "ideate_manual": "Ideate — manual", "ideate_ai": "Ideate — AI",
+    "ideate": "Idea generation write-up",
+    "debug": "Debugging write-up",
 }
 
 
@@ -90,30 +132,35 @@ def notebook_filename(subject_id: str) -> str:
     return f"{subject_id}_notebook.ipynb"
 
 
-def stage2_expected(subject_id: str) -> dict[str, tuple[str, str | None]]:
-    """{exact filename: (kind, doc_type)} for the six Part 2 uploads."""
-    exp: dict[str, tuple[str, str | None]] = {
-        f"{subject_id}_{suffix}": ("doc", doc_type)
-        for doc_type, suffix in DOC_SUFFIXES.items()
-    }
-    exp[f"{subject_id}_claude_log.jsonl"] = ("log", None)
-    return exp
+def doc_filename(subject_id: str, doc_type: str) -> str:
+    return f"{subject_id}_{DOC_SUFFIXES[doc_type]}"
 
 
-def _part2_uploaded(subject_id: str) -> bool:
-    """True once all 5 reflection docs and at least one session log are on
-    file -- used to resume a participant who finished Part 2's file upload
-    but dropped off before the post-survey, straight at the post-survey
-    instead of making them re-upload files they already submitted."""
-    bundle = get_participant_bundle(subject_id)
-    have_docs = {d["doc_type"] for d in bundle["files"]}
-    return set(DOC_SUFFIXES).issubset(have_docs) and bool(bundle["logs"])
+def log_filename(subject_id: str) -> str:
+    return f"{subject_id}_claude_log.jsonl"
 
 
 def reset() -> None:
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     st.session_state.p_stage = "identify"
+
+
+def goto(stage: str) -> None:
+    """Advance to `stage`, remembering it so the participant can resume there."""
+    sid = st.session_state.get("subject_id")
+    if sid:
+        set_participant_stage(sid, stage, STAGE_STATUS.get(stage))
+    st.session_state.p_stage = stage
+    st.rerun()
+
+
+def _decode(upload) -> str:
+    raw = upload.getvalue()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
 
 
 def _run_hidden_grading(subject_id: str, notebook_text: str) -> None:
@@ -141,13 +188,111 @@ def _run_hidden_grading(subject_id: str, notebook_text: str) -> None:
         set_participant_grading_error(subject_id, f"{type(e).__name__}: {e}")
 
 
+def render_task_screen(*, task_key: str, next_stage: str) -> None:
+    """Instructions, then a Start button, then the clock. Shared by all three
+    tasks; the only differences are which document is shown and whether there's
+    an allowance to count down."""
+    sid = st.session_state.subject_id
+    condition = st.session_state.condition
+    limit = tasks.TASK_LIMIT_SECONDS[task_key]
+
+    instruction = get_task_instruction(tasks.instruction_key_for(task_key, condition))
+    readable = tasks.render_instructions(instruction, task_key)
+
+    # Session state is empty in a browser session that didn't start the task, so
+    # fall back to the stored row: someone resuming a task they already began
+    # must get their running clock back, not a fresh allowance.
+    timing = st.session_state.get(f"timing_{task_key}")
+    if timing is None:
+        timing = get_participant_task_timing(sid, task_key)
+        if timing is not None:
+            st.session_state[f"timing_{task_key}"] = timing
+    if timing is None:
+        st.divider()
+        if limit is None:
+            st.markdown(
+                "**There's no time limit on this task** — we only record how long "
+                "it takes. Start when you're ready to begin."
+            )
+        else:
+            st.markdown(
+                f"**You'll have {tasks.format_duration(limit)}.** The timer starts "
+                "when you click below and will beep when the time is up — you can "
+                "still finish and upload after it does."
+            )
+        if st.button("Start the task", type="primary", disabled=not readable):
+            st.session_state[f"timing_{task_key}"] = start_participant_task(
+                sid, task_key, limit
+            )
+            st.rerun()
+        return
+
+    started = _started_epoch(timing)
+    tasks.render_countdown(started_at_epoch=started, limit_seconds=limit)
+    st.caption(
+        "Leave this page open while you work. If it closes, re-enter your "
+        "Subject ID — the clock keeps running from when you started."
+    )
+    if st.button("I've finished — continue", type="primary"):
+        finish_participant_task(sid, task_key)
+        goto(next_stage)
+
+
+def _started_epoch(timing: dict) -> float:
+    """started_at as a POSIX timestamp. Supabase returns ISO-8601 with a Z or a
+    +00:00 offset depending on the column; both parse once Z is normalised."""
+    from datetime import datetime, timezone
+
+    raw = (timing or {}).get("started_at")
+    if not raw:
+        return datetime.now(timezone.utc).timestamp()
+    try:
+        text = str(raw).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except ValueError:
+        return datetime.now(timezone.utc).timestamp()
+
+
+def render_single_doc_upload(*, doc_type: str, task_key: str, next_stage: str) -> None:
+    """Upload exactly one markdown document, named for the participant."""
+    sid = st.session_state.subject_id
+    want = doc_filename(sid, doc_type)
+    st.markdown(
+        f"Upload your **{DOC_TITLES[doc_type].lower()}** — it must be named "
+        f"`{want}` exactly."
+    )
+    uploaded = st.file_uploader(DOC_TITLES[doc_type], type=["md"], key=f"up_{doc_type}")
+    ok_name = uploaded is not None and uploaded.name == want
+    if uploaded is not None and not ok_name:
+        st.error(f"🚫 `{uploaded.name}` — rename it to `{want}` and select it again.")
+    elif ok_name:
+        st.success(f"✅ `{want}`")
+
+    if st.button("Submit and continue", type="primary", disabled=not ok_name):
+        ok, err = save_participant_file(sid, doc_type, want, _decode(uploaded))
+        if not ok:
+            st.error(f"Could not save {want}: {err}")
+            st.stop()
+        finish_participant_task(sid, task_key)
+        goto(next_stage)
+
+
 if "p_stage" not in st.session_state:
     st.session_state.p_stage = "identify"
 
 st.title("📥 Study Submission")
 
+_stage = st.session_state.p_stage
+if _stage in STAGE_STEP:
+    _label, _n = STAGE_STEP[_stage]
+    st.caption(f"Step {_n} of {N_STEPS} · {_label}")
+    st.progress((_n - 1) / N_STEPS)
+
 # ---- Stage: identify ------------------------------------------------------
-if st.session_state.p_stage == "identify":
+if _stage == "identify":
     subject_id = st.text_input("Subject ID", placeholder="P001").strip()
     id_ok = bool(SUBJECT_ID_RE.match(subject_id))
     if subject_id and not id_ok:
@@ -156,11 +301,11 @@ if st.session_state.p_stage == "identify":
     existing = get_participant(subject_id) if id_ok else None
     status = existing["status"] if existing else None
 
-    # --- brand-new participant: Part 1 ---
+    # --- brand-new participant ---
     if id_ok and existing is None:
         st.markdown(
-            "**New submission — Part 1.** Answer a short survey, then upload your "
-            "notebook and take a short quiz."
+            "**New submission.** You'll answer a short survey, work through three "
+            "tasks with a break for some questions, and finish with a closing survey."
         )
         condition_text = st.text_input(
             "Condition (as assigned to you)", placeholder="e.g. control"
@@ -168,47 +313,20 @@ if st.session_state.p_stage == "identify":
         condition = normalize_condition(condition_text)
         if condition_text and condition is None:
             st.error("Unrecognized condition. Enter the exact condition you were assigned.")
-        if st.button("Start Part 1", type="primary", disabled=not condition):
+        if st.button("Begin", type="primary", disabled=not condition):
             ok, err = upsert_participant(subject_id, condition)
             if not ok:
                 st.error(f"Could not start the submission: {err}")
                 st.stop()
             st.session_state.subject_id = subject_id
             st.session_state.condition = condition
-            st.session_state.p_stage = "pre_survey"
-            st.rerun()
+            goto("pre_survey")
 
-    # --- started Part 1 but didn't finish the quiz ---
-    elif status == "in_progress":
-        st.info("You started Part 1 but didn't finish. You'll resume where you left off.")
-        if st.button("Resume Part 1", type="primary"):
-            st.session_state.subject_id = subject_id
-            st.session_state.condition = existing["condition"]
-            already_surveyed = get_participant_survey(subject_id, "pre") is not None
-            st.session_state.p_stage = "nb_upload" if already_surveyed else "pre_survey"
-            st.rerun()
-
-    # --- Part 1 done, needs Part 2 ---
-    elif status == "quiz_done":
-        st.success(
-            f"Part 1 is complete for **{subject_id}**. Upload your reflection files "
-            "and session log to finish."
-        )
-        if st.button("Continue to Part 2", type="primary"):
-            st.session_state.subject_id = subject_id
-            st.session_state.condition = existing["condition"]
-            # If they already uploaded Part 2's files and just dropped off before
-            # the post-survey, resume there instead of asking them to re-upload.
-            st.session_state.p_stage = (
-                "post_survey" if _part2_uploaded(subject_id) else "docs_upload"
-            )
-            st.rerun()
-
-    # --- already fully submitted ---
+    # --- already finished ---
     elif status == "complete":
         st.warning(
             f"A complete submission for **{subject_id}** already exists. Continuing "
-            "replaces it entirely (both parts)."
+            "replaces it entirely."
         )
         if st.checkbox("Replace the existing submission"):
             if st.button("Start over", type="primary"):
@@ -218,183 +336,230 @@ if st.session_state.p_stage == "identify":
                     st.stop()
                 st.session_state.subject_id = subject_id
                 st.session_state.condition = existing["condition"]
-                st.session_state.p_stage = "pre_survey"
-                st.rerun()
+                goto("pre_survey")
 
-# ---- Stage: pre-survey (right at the start, before anything else) ------
-elif st.session_state.p_stage == "pre_survey":
+    # --- partway through: resume exactly where they stopped ---
+    elif id_ok and existing is not None:
+        resume = existing.get("stage")
+        if resume not in STAGES:
+            # Started before per-stage resume existed, or never got past the
+            # opening survey: fall back to the survey, skipping it if it's done.
+            resume = "main_task" if get_participant_survey(subject_id, "pre") else "pre_survey"
+        label = STAGE_STEP.get(resume, ("Closing survey", N_STEPS))[0]
+        st.info(f"Welcome back — you'll pick up at **{label}**.")
+        if st.button("Resume", type="primary"):
+            st.session_state.subject_id = subject_id
+            st.session_state.condition = existing["condition"]
+            goto(resume)
+
+# ---- Stage: opening survey -----------------------------------------------
+elif _stage == "pre_survey":
     st.markdown(
         "**Before you begin.** A short survey — there's no time limit, but we do "
         "track how long each question takes. You won't see a score."
     )
-    done = render_survey_flow(
+    if render_survey_flow(
         subject_id=st.session_state.subject_id, survey_type="pre", items=PRE_SURVEY_ITEMS,
-    )
-    if done:
-        st.session_state.p_stage = "nb_upload"
-        st.rerun()
+    ):
+        goto("main_task")
 
-# ---- Stage: notebook upload (Part 1) ------------------------------------
-elif st.session_state.p_stage == "nb_upload":
-    subject_id = st.session_state.subject_id
-    nb_name = notebook_filename(subject_id)
+# ---- Stage: main task ----------------------------------------------------
+elif _stage == "main_task":
+    render_task_screen(task_key=tasks.MAIN, next_stage="main_upload")
+
+# ---- Stage: main task upload ---------------------------------------------
+elif _stage == "main_upload":
+    sid = st.session_state.subject_id
+    nb_name = notebook_filename(sid)
+    plan_name = doc_filename(sid, "task_plan")
     st.markdown(
-        f"**Part 1 · Subject {subject_id}.** Upload your notebook — it must be named "
-        f"`{nb_name}` exactly."
+        "**Upload your main-task files.** Two are required, named exactly as shown:"
     )
-    uploaded = st.file_uploader("Notebook", type=["ipynb"], accept_multiple_files=True)
-    names = {f.name for f in (uploaded or [])}
+    st.code(f"{plan_name}\n{nb_name}", language="text")
 
-    ok_names = names == {nb_name}
-    for name in sorted(names):
-        st.markdown(("✅ " if name == nb_name else "🚫 ") + f"`{name}`"
-                    + ("" if name == nb_name else " — remove or rename this file"))
-    if not names:
-        st.info(f"Select `{nb_name}`.")
-    elif not ok_names and nb_name not in names:
-        st.info(f"Expected exactly `{nb_name}`.")
+    required = st.file_uploader(
+        "Plan and notebook", type=["md", "ipynb"], accept_multiple_files=True,
+        key="up_main_required",
+    )
+    by_name = {f.name: f for f in (required or [])}
+    have_plan, have_nb = plan_name in by_name, nb_name in by_name
+    for name, present in ((plan_name, have_plan), (nb_name, have_nb)):
+        st.markdown(("✅ " if present else "❌ ") + f"`{name}`")
+    for name in sorted(n for n in by_name if n not in (plan_name, nb_name)):
+        st.markdown(f"🚫 unexpected: `{name}` — rename it, or add it as an extra file below")
 
-    if st.button("Submit notebook", type="primary", disabled=not ok_names):
+    st.markdown("#### Anything else? (optional)")
+    st.caption(
+        "Scratch scripts, figures, exports — anything else you produced. Any "
+        "filename is fine here."
+    )
+    extras = st.file_uploader(
+        "Additional files", accept_multiple_files=True, key="up_main_extra",
+    )
+    for f in extras or []:
+        st.markdown(f"📎 `{f.name}`")
+
+    ready = have_plan and have_nb
+    if not ready:
+        st.info("Submit unlocks once both required files are selected.")
+
+    if st.button("Submit and continue", type="primary", disabled=not ready):
         try:
-            notebook_text = notebook_to_text(next(f for f in uploaded if f.name == nb_name).getvalue())
+            notebook_text = notebook_to_text(by_name[nb_name].getvalue())
         except Exception as e:
             st.error(f"Could not read {nb_name}: {e}")
             st.stop()
         if not notebook_text.strip():
             st.error(f"{nb_name} appears to be empty.")
             st.stop()
-        ok, err = save_participant_notebook(subject_id, nb_name, notebook_text)
-        if not ok:
-            st.error(f"Could not save the notebook: {err}")
-            st.stop()
-        st.session_state.notebook_text = notebook_text
-        st.session_state.notebook_filename = nb_name
-        st.session_state.p_stage = "quiz"
-        st.rerun()
 
-# ---- Stage: quiz (Part 1) ---------------------------------------------
-elif st.session_state.p_stage == "quiz":
-    st.markdown(
-        "Answer each question about **your own submission**. There is no time limit — "
-        "a stopwatch just tracks how long you take. You won't see a score."
-    )
-    done = render_quiz_flow(
-        notebook_text=st.session_state.notebook_text,
-        notebook_filename=st.session_state.notebook_filename,
-        subject_id=st.session_state.subject_id,
-    )
-    if done:
-        st.session_state.p_stage = "finalize"
-        st.rerun()
-
-# ---- Stage: finalize Part 1 (hidden grading) -------------------------
-elif st.session_state.p_stage == "finalize":
-    subject_id = st.session_state.subject_id
-    with st.spinner("Finalizing Part 1…"):
-        _run_hidden_grading(subject_id, st.session_state.notebook_text)
-        mark_participant_stage1_done(subject_id)
-    st.session_state.p_stage = "stage1_done"
-    st.rerun()
-
-# ---- Stage: Part 1 done ---------------------------------------------
-elif st.session_state.p_stage == "stage1_done":
-    st.success(
-        f"✅ Part 1 received for **{st.session_state.subject_id}** — notebook and quiz "
-        "complete."
-    )
-    st.markdown(
-        "**Part 2:** upload your five reflection documents and your Claude Code "
-        "session log, then a short closing survey. You can do that now, or come "
-        "back to this page any time and enter the same Subject ID."
-    )
-    col_a, col_b = st.columns(2)
-    if col_a.button("Continue to Part 2 now", type="primary"):
-        st.session_state.p_stage = "docs_upload"
-        st.rerun()
-    if col_b.button("I'll come back later"):
-        reset()
-        st.rerun()
-
-# ---- Stage: documents + log upload (Part 2) --------------------------
-elif st.session_state.p_stage == "docs_upload":
-    subject_id = st.session_state.subject_id
-    exp = stage2_expected(subject_id)
-    st.markdown(
-        f"**Part 2 · Subject {subject_id}.** Select all **6 files** — each must be "
-        f"named `{subject_id}_<name>` exactly:"
-    )
-    st.code("\n".join(sorted(exp)), language="text")
-
-    uploaded = st.file_uploader(
-        "Reflection files + session log", type=["md", "jsonl"], accept_multiple_files=True
-    )
-    by_name = {f.name: f for f in (uploaded or [])}
-    missing = [n for n in exp if n not in by_name]
-    unexpected = [n for n in by_name if n not in exp]
-
-    st.markdown("#### File check")
-    for name in sorted(exp):
-        st.markdown(("✅ " if name in by_name else "❌ ") + f"`{name}`")
-    for name in sorted(unexpected):
-        st.markdown(f"🚫 unexpected: `{name}` — remove or rename this file")
-
-    ready = not missing and not unexpected
-    if not ready:
-        st.info("Submit unlocks once exactly the 6 correctly-named files are selected.")
-
-    if st.button("Submit files", type="primary", disabled=not ready):
         errors: list[str] = []
         with st.spinner("Saving your files…"):
-            for name, (kind, doc_type) in exp.items():
-                if kind != "doc":
-                    continue
-                try:
-                    content = by_name[name].getvalue().decode("utf-8-sig")
-                except UnicodeDecodeError:
-                    content = by_name[name].getvalue().decode("latin-1")
-                ok, err = save_participant_file(subject_id, doc_type, name, content)
-                if not ok:
-                    errors.append(f"{name}: {err}")
-
-            log_name = f"{subject_id}_claude_log.jsonl"
-            raw_jsonl = by_name[log_name].getvalue().decode("utf-8", errors="replace")
-            metrics = compute_log_metrics(parse_jsonl(raw_jsonl))
-            ok, err = save_participant_log(subject_id, log_name, raw_jsonl, metrics)
+            ok, err = save_participant_notebook(sid, nb_name, notebook_text)
             if not ok:
-                errors.append(f"{log_name}: {err}")
-
-            st.session_state.part2_manifest = {
-                "notebook": notebook_filename(subject_id),
-                "part2": sorted(exp),
-                "received": sorted(by_name),
-            }
-
+                errors.append(f"{nb_name}: {err}")
+            ok, err = save_participant_file(
+                sid, "task_plan", plan_name, _decode(by_name[plan_name])
+            )
+            if not ok:
+                errors.append(f"{plan_name}: {err}")
+            for f in extras or []:
+                ok, err = save_participant_extra_file(sid, f.name, f.getvalue())
+                if not ok:
+                    errors.append(f"{f.name}: {err}")
         if errors:
             st.error("Some files could not be saved:\n\n" + "\n".join(errors))
             st.stop()
-        st.session_state.p_stage = "post_survey"
+
+        st.session_state.notebook_text = notebook_text
+        st.session_state.notebook_filename = nb_name
+        finish_participant_task(sid, tasks.MAIN)
+        goto("ideate_task")
+
+# ---- Stage: ideation task ------------------------------------------------
+elif _stage == "ideate_task":
+    render_task_screen(task_key=tasks.IDEATE, next_stage="ideate_upload")
+
+elif _stage == "ideate_upload":
+    render_single_doc_upload(
+        doc_type="ideate", task_key=tasks.IDEATE, next_stage="quiz",
+    )
+
+# ---- Stage: MCQ about their own notebook ---------------------------------
+elif _stage == "quiz":
+    sid = st.session_state.subject_id
+    if "notebook_text" not in st.session_state:
+        # Resumed in a fresh browser session — the notebook is on file, so pull
+        # it back rather than asking for it again.
+        from db import get_participant_bundle
+
+        nb = get_participant_bundle(sid)["notebook"]
+        if not nb:
+            st.error(
+                "We couldn't find your notebook on file. Please tell the researcher."
+            )
+            st.stop()
+        st.session_state.notebook_text = nb["notebook_text"]
+        st.session_state.notebook_filename = nb["filename"]
+
+    st.markdown(
+        "Answer each question about **your own notebook**. There is no time limit — "
+        "a stopwatch just tracks how long you take. You won't see a score."
+    )
+    if render_quiz_flow(
+        notebook_text=st.session_state.notebook_text,
+        notebook_filename=st.session_state.notebook_filename,
+        subject_id=sid,
+    ):
+        set_participant_stage(sid, "interview", "quiz_done")
+        st.session_state.p_stage = "interview"
         st.rerun()
 
-# ---- Stage: post-survey (after Part 2 materials are uploaded) ----------
-elif st.session_state.p_stage == "post_survey":
+# ---- Stage: interview hand-off -------------------------------------------
+elif _stage == "interview":
     st.markdown(
-        "**Almost done.** One more short survey about your experience with the "
+        "### Interview\n\n"
+        "Now, to get more of your thoughts on the design, you will answer some "
+        "questions verbally in an interview style.\n\n"
+        "The researcher will take it from here — nothing to upload for this part."
+    )
+    st.info("When the interview is over, click below to continue to the last task.")
+    if st.button("The interview is over — continue", type="primary"):
+        goto("debug_task")
+
+# ---- Stage: debugging task -----------------------------------------------
+elif _stage == "debug_task":
+    render_task_screen(task_key=tasks.DEBUG, next_stage="debug_upload")
+
+elif _stage == "debug_upload":
+    render_single_doc_upload(
+        doc_type="debug", task_key=tasks.DEBUG, next_stage="log_upload",
+    )
+
+# ---- Stage: session log --------------------------------------------------
+elif _stage == "log_upload":
+    sid = st.session_state.subject_id
+    want = log_filename(sid)
+    st.markdown(
+        f"**Almost there.** Upload your Claude Code session log — named `{want}` "
+        "exactly. If you worked across several sessions, select all of them."
+    )
+    uploaded = st.file_uploader(
+        "Session log", type=["jsonl"], accept_multiple_files=True, key="up_log",
+    )
+    files = list(uploaded or [])
+    # Several sessions are fine, but each file still has to be recognisably this
+    # participant's: exactly the canonical name, or that name plus a suffix.
+    stem = want[: -len(".jsonl")]
+    good = [f for f in files if f.name == want or f.name.startswith(f"{stem}_")]
+    bad = [f for f in files if f not in good]
+    for f in good:
+        st.markdown(f"✅ `{f.name}`")
+    for f in bad:
+        st.markdown(f"🚫 `{f.name}` — expected `{want}` (or `{stem}_2.jsonl` for a second session)")
+    if not files:
+        st.info(f"Select `{want}`.")
+
+    if st.button("Submit and continue", type="primary", disabled=not good or bool(bad)):
+        errors = []
+        with st.spinner("Saving your log…"):
+            for f in good:
+                raw = f.getvalue().decode("utf-8", errors="replace")
+                metrics = compute_log_metrics(parse_jsonl(raw))
+                ok, err = save_participant_log(sid, f.name, raw, metrics)
+                if not ok:
+                    errors.append(f"{f.name}: {err}")
+        if errors:
+            st.error("Could not save:\n\n" + "\n".join(errors))
+            st.stop()
+        st.session_state.log_names = [f.name for f in good]
+        goto("post_survey")
+
+# ---- Stage: closing survey -----------------------------------------------
+elif _stage == "post_survey":
+    st.markdown(
+        "**Last step.** One more short survey about your experience with the "
         "tasks. There's no time limit, but we do track how long each question "
         "takes. You won't see a score."
     )
-    done = render_survey_flow(
+    if render_survey_flow(
         subject_id=st.session_state.subject_id, survey_type="post", items=POST_SURVEY_ITEMS,
-    )
-    if done:
-        manifest = st.session_state.get("part2_manifest") or {
-            "notebook": notebook_filename(st.session_state.subject_id),
-        }
-        mark_participant_complete(st.session_state.subject_id, manifest)
+    ):
+        sid = st.session_state.subject_id
+        with st.spinner("Finishing up…"):
+            if "notebook_text" in st.session_state:
+                _run_hidden_grading(sid, st.session_state.notebook_text)
+            mark_participant_complete(sid, {
+                "notebook": notebook_filename(sid),
+                "docs": [doc_filename(sid, d) for d in DOC_SUFFIXES],
+                "logs": st.session_state.get("log_names", []),
+            })
+            set_participant_stage(sid, "complete", "complete")
         st.session_state.p_stage = "complete"
         st.rerun()
 
-# ---- Stage: complete ---------------------------------------------
-elif st.session_state.p_stage == "complete":
+# ---- Stage: complete -----------------------------------------------------
+elif _stage == "complete":
     st.success(
         f"✅ Submission complete for **{st.session_state.subject_id}** — thank you!"
     )

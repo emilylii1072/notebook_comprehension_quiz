@@ -7,6 +7,7 @@ returns None and callers should degrade gracefully -- the app must keep working
 without a database attached.
 """
 
+import base64
 import os
 import random
 from datetime import datetime, timezone
@@ -374,7 +375,8 @@ def upsert_participant(subject_id: str, condition: str) -> tuple[bool, str | Non
     try:
         for table in ("participant_files", "participant_notebooks",
                       "participant_quiz", "participant_logs",
-                      "participant_turn_annotations", "participant_surveys"):
+                      "participant_turn_annotations", "participant_surveys",
+                      "participant_task_timings", "participant_extra_files"):
             client.table(table).delete().eq("subject_id", subject_id).execute()
         client.table("participants").upsert(
             {
@@ -385,6 +387,7 @@ def upsert_participant(subject_id: str, condition: str) -> tuple[bool, str | Non
                 "grading_error": None,
                 "submitted_at": None,
                 "file_manifest": None,
+                "stage": None,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
             on_conflict="subject_id",
@@ -625,25 +628,6 @@ def delete_participant_log(subject_id: str, filename: str) -> tuple[bool, str | 
     return True, None
 
 
-def mark_participant_stage1_done(subject_id: str) -> tuple[bool, str | None]:
-    """Part 1 (notebook + quiz + grading) is done; Part 2 (docs + log) still owed.
-    No-op on a participant already marked complete."""
-    client = get_supabase_client()
-    if client is None:
-        return False, "Database not configured."
-    try:
-        (
-            client.table("participants")
-            .update({"status": "quiz_done"})
-            .eq("subject_id", subject_id)
-            .neq("status", "complete")
-            .execute()
-        )
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
 def mark_participant_complete(
     subject_id: str, file_manifest: dict
 ) -> tuple[bool, str | None]:
@@ -711,6 +695,7 @@ def get_participant_bundle(subject_id: str) -> dict:
     empty = {
         "participant": None, "files": [], "notebook": None, "quiz": None,
         "logs": [], "transcript": None, "pre_survey": None, "post_survey": None,
+        "task_timings": {}, "extra_files": [],
     }
     if client is None:
         return empty
@@ -743,6 +728,8 @@ def get_participant_bundle(subject_id: str) -> dict:
         out["transcript"] = tr[0] if tr else None
         out["pre_survey"] = get_participant_survey(subject_id, "pre")
         out["post_survey"] = get_participant_survey(subject_id, "post")
+        out["task_timings"] = list_participant_task_timings(subject_id)
+        out["extra_files"] = list_participant_extra_files(subject_id)
     except Exception:
         pass
     return out
@@ -1113,3 +1100,249 @@ def list_participant_survey_rows() -> list[dict]:
                 "time_spent_seconds": r.get("time_spent_seconds"),
             })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Task instructions (admin-authored, shown to participants)
+# ---------------------------------------------------------------------------
+
+def save_task_instruction(
+    task_key: str, content: str, title: str | None = None
+) -> tuple[bool, str | None]:
+    """Upsert the instruction document for one task screen. `task_key` is one of
+    lib.tasks.INSTRUCTION_KEYS; `content` is markdown shown to the participant
+    verbatim."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured (SUPABASE_URL/SUPABASE_KEY not set)."
+    try:
+        client.table("task_instructions").upsert(
+            {
+                "task_key": task_key,
+                "title": (title or "").strip() or None,
+                "content": content,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="task_key",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_task_instruction(task_key: str) -> dict | None:
+    """One task's instruction document, or None if it hasn't been uploaded."""
+    client = get_supabase_client()
+    if client is None or not task_key:
+        return None
+    try:
+        rows = (
+            client.table("task_instructions").select("*")
+            .eq("task_key", task_key).limit(1).execute().data or []
+        )
+    except Exception:
+        return None
+    return rows[0] if rows else None
+
+
+def list_task_instructions() -> dict[str, dict]:
+    """{task_key: row} for every uploaded instruction document."""
+    client = get_supabase_client()
+    if client is None:
+        return {}
+    try:
+        rows = client.table("task_instructions").select("*").execute().data or []
+    except Exception:
+        return {}
+    return {r["task_key"]: r for r in rows}
+
+
+def delete_task_instruction(task_key: str) -> tuple[bool, str | None]:
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("task_instructions").delete().eq("task_key", task_key).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# Per-task timing
+# ---------------------------------------------------------------------------
+
+def start_participant_task(
+    subject_id: str, task_key: str, limit_seconds: int | None
+) -> dict | None:
+    """Mark a timed task as started and return its timing row.
+
+    Deliberately does NOT move an existing started_at: a participant who
+    refreshes the page, or comes back to a task screen, resumes the clock they
+    already started rather than getting a fresh allowance."""
+    client = get_supabase_client()
+    if client is None:
+        return None
+    existing = get_participant_task_timing(subject_id, task_key)
+    if existing is not None:
+        return existing
+    try:
+        client.table("participant_task_timings").upsert(
+            {
+                "subject_id": subject_id,
+                "task_key": task_key,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "finished_at": None,
+                "limit_seconds": limit_seconds,
+            },
+            on_conflict="subject_id,task_key",
+        ).execute()
+    except Exception:
+        return None
+    return get_participant_task_timing(subject_id, task_key)
+
+
+def finish_participant_task(subject_id: str, task_key: str) -> tuple[bool, str | None]:
+    """Stamp finished_at. Re-finishing (e.g. a re-upload) moves it, so the
+    recorded span always covers everything the participant did on that task."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_task_timings").update(
+            {"finished_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("subject_id", subject_id).eq("task_key", task_key).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_participant_task_timing(subject_id: str, task_key: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        rows = (
+            client.table("participant_task_timings").select("*")
+            .eq("subject_id", subject_id).eq("task_key", task_key)
+            .limit(1).execute().data or []
+        )
+    except Exception:
+        return None
+    return rows[0] if rows else None
+
+
+def list_participant_task_timings(subject_id: str) -> dict[str, dict]:
+    """{task_key: timing row} for one participant."""
+    client = get_supabase_client()
+    if client is None:
+        return {}
+    try:
+        rows = (
+            client.table("participant_task_timings").select("*")
+            .eq("subject_id", subject_id).execute().data or []
+        )
+    except Exception:
+        return {}
+    return {r["task_key"]: r for r in rows}
+
+
+def list_all_task_timings() -> list[dict]:
+    """Every participant's task timings, for the cohort view."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        return client.table("participant_task_timings").select("*").execute().data or []
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Extra main-task files
+# ---------------------------------------------------------------------------
+
+def save_participant_extra_file(
+    subject_id: str, filename: str, raw: bytes
+) -> tuple[bool, str | None]:
+    """Store one optional main-task attachment under its own name. Text is kept
+    verbatim; anything that isn't valid UTF-8 is base64'd so binaries (figures,
+    exports) survive a round trip."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        content, encoding = raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        content, encoding = base64.b64encode(raw).decode("ascii"), "base64"
+    try:
+        client.table("participant_extra_files").upsert(
+            {
+                "subject_id": subject_id,
+                "filename": filename,
+                "content": content,
+                "encoding": encoding,
+                "byte_size": len(raw),
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="subject_id,filename",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def list_participant_extra_files(subject_id: str) -> list[dict]:
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        return (
+            client.table("participant_extra_files").select("*")
+            .eq("subject_id", subject_id).execute().data or []
+        )
+    except Exception:
+        return []
+
+
+def delete_participant_extra_file(subject_id: str, filename: str) -> tuple[bool, str | None]:
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_extra_files").delete().eq(
+            "subject_id", subject_id
+        ).eq("filename", filename).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def extra_file_bytes(row: dict) -> bytes:
+    """The original bytes of a stored attachment, whichever way it was encoded."""
+    content = row.get("content") or ""
+    if (row.get("encoding") or "utf-8") == "base64":
+        return base64.b64decode(content)
+    return content.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Resume point
+# ---------------------------------------------------------------------------
+
+def set_participant_stage(
+    subject_id: str, stage: str, status: str | None = None
+) -> tuple[bool, str | None]:
+    """Record which screen the participant is on, so re-entering their subject ID
+    resumes exactly there. `status` is kept in step for the Admin overview."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    payload: dict = {"stage": stage}
+    if status is not None:
+        payload["status"] = status
+    try:
+        client.table("participants").update(payload).eq("subject_id", subject_id).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)

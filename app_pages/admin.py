@@ -1,10 +1,15 @@
 """Admin — the researcher's view of every participant.
 
-Password-gated (set ADMIN_PASSWORD in secrets / .env). Six top-level tabs:
+Password-gated (set ADMIN_PASSWORD in secrets / .env). Seven top-level tabs:
   1. Overview        — one row per participant, filter by condition, CSV export
-  2. Participant     — sub-tabs per task/data type: Surveys, Task plan, Debug
-                       (manual vs AI), Ideate (manual vs AI), Notebook grade,
-                       Quiz, Verbal assessment, Session timeline, Raw files.
+  2. Participant     — sub-tabs per task/data type: Surveys, Task timing, Task
+                       plan, Ideate, Debug, Notebook grade, Quiz, Verbal
+                       assessment, Session timeline, Raw files.
+                       Task timing shows how long each timed task actually took
+                       against its allowance, plus any extra files attached to
+                       the main task. Ideate/Debug are one document each; a
+                       participant run under the earlier manual-vs-AI protocol
+                       still shows those split documents underneath.
                        Surveys shows this one participant's pre-/post-survey
                        (lib/surveys.py, transcribed from the study's Qualtrics
                        PDFs) with per-item timing and ✅/❌ on the scored
@@ -20,8 +25,12 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Six top-level tabs:
                        gain against lib.surveys.ANSWER_KEY, attitude shift,
                        workload, self-assessed vs rubric grade, background,
                        free text, and a long-format CSV export
-  5. Notebook report — the visual grading report across all graded notebooks
-  6. Grading         — browse/upload any rubric version, grade or re-grade
+  5. Task instructions — the markdown each task screen shows the participant:
+                       one main-task document per condition plus the shared
+                       ideation and debugging ones (lib/tasks.py). Participants
+                       cannot start a task whose document is missing.
+  6. Notebook report — the visual grading report across all graded notebooks
+  7. Grading         — browse/upload any rubric version, grade or re-grade
                        (individually or in bulk) against whichever one you pick;
                        also hosts "Annotate everything pending" (lib/annotate.py),
                        the cross-participant bulk version of the turn tagging above
@@ -40,9 +49,12 @@ from build_report import records_from_graded, render_report
 from db import (
     annotated_turn_indexes,
     delete_participant_file,
+    delete_participant_extra_file,
     delete_participant_log,
     delete_participant_notebook,
+    delete_task_instruction,
     delete_turn_annotations,
+    extra_file_bytes,
     get_participant_bundle,
     get_rubric,
     get_secret,
@@ -54,18 +66,20 @@ from db import (
     list_participant_transcripts_raw,
     list_pending_grading,
     list_rubrics,
+    list_task_instructions,
     list_turn_annotations,
     save_participant_file,
     save_participant_log,
     save_participant_notebook,
     save_participant_transcript,
     save_rubric,
+    save_task_instruction,
     save_turn_annotations,
     set_participant_grading_error,
     supabase_status,
     update_participant_grading,
 )
-from lib import annotate, cohort, grading, survey_stats, transcript
+from lib import annotate, cohort, grading, survey_stats, tasks, transcript
 from lib.llm import get_client
 from lib.notebook import notebook_to_text
 from lib.quiz_ui import render_quiz_breakdown
@@ -83,11 +97,18 @@ CONDITION_LABEL = cohort.CONDITION_LABEL
 ACTIVE_RUBRIC_NAME = get_secret("ACTIVE_RUBRIC_NAME", grading.DEFAULT_RUBRIC_NAME)
 DOC_TITLES = {
     "task_plan": "Task plan",
-    "debug_manual": "Debug — manual", "debug_ai": "Debug — AI",
-    "ideate_manual": "Ideate — manual", "ideate_ai": "Ideate — AI",
+    "ideate": "Idea generation write-up",
+    "debug": "Debugging write-up",
+    # Collected under the earlier manual-vs-AI protocol. Nothing writes these
+    # any more, but participants run back then still have them, so they stay
+    # displayable (and replaceable) here.
+    "debug_manual": "Debug — manual (legacy)", "debug_ai": "Debug — AI (legacy)",
+    "ideate_manual": "Ideate — manual (legacy)", "ideate_ai": "Ideate — AI (legacy)",
 }
 DOC_SUFFIXES = {
     "task_plan": "task_plan.md",
+    "ideate": "ideate.md",
+    "debug": "debug.md",
     "debug_manual": "debug_manual.md", "debug_ai": "debug_ai.md",
     "ideate_manual": "ideate_manual.md", "ideate_ai": "ideate_ai.md",
 }
@@ -108,6 +129,25 @@ if not st.session_state.get("admin_ok"):
         else:
             st.error("Incorrect password.")
     st.stop()
+
+
+def _timing_seconds(timing: dict) -> float | None:
+    """How long a task took: finished_at - started_at, or None while it's still
+    open. Supabase hands these back as ISO-8601 strings."""
+    from datetime import datetime
+
+    def _parse(raw):
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    start, end = _parse(timing.get("started_at")), _parse(timing.get("finished_at"))
+    if start is None or end is None:
+        return None
+    return (end - start).total_seconds()
 
 
 def _grade_one(subject_id: str, notebook_text: str, rubric_name: str) -> tuple[bool, str]:
@@ -306,9 +346,12 @@ def _notebook_upload_widget(sid: str, exists: bool) -> None:
                 st.rerun()
 
 
-tab_overview, tab_detail, tab_cohort, tab_surveys, tab_report, tab_grading = st.tabs(
+(
+    tab_overview, tab_detail, tab_cohort, tab_surveys,
+    tab_tasks, tab_report, tab_grading,
+) = st.tabs(
     ["1 · Overview", "2 · Participant", "3 · Cohort stats", "4 · Survey results",
-     "5 · Notebook report", "6 · Grading & rubric"]
+     "5 · Task instructions", "6 · Notebook report", "7 · Grading & rubric"]
 )
 
 _section_rows = list_notebook_section_scores()  # (participant, section) grades; used in tabs 2 & 3
@@ -370,10 +413,10 @@ with tab_detail:
         logs = bundle["logs"]
 
         (
-            sub_surveys, sub_taskplan, sub_debug, sub_ideate,
+            sub_surveys, sub_timings, sub_taskplan, sub_ideate, sub_debug,
             sub_notebook, sub_quiz, sub_verbal, sub_timeline, sub_files,
         ) = st.tabs([
-            "Surveys", "Task plan", "Debug: manual vs AI", "Ideate: manual vs AI",
+            "Surveys", "Task timing", "Task plan", "Ideate", "Debug",
             "Notebook grade", "Quiz", "Verbal assessment", "Session timeline", "Raw files",
         ])
 
@@ -390,18 +433,71 @@ with tab_detail:
             with st.expander("Upload / replace"):
                 _doc_upload_widget(sid, "task_plan", DOC_TITLES["task_plan"], "task_plan" in docs)
 
-        for sub, left, right in (
-            (sub_debug, "debug_manual", "debug_ai"),
-            (sub_ideate, "ideate_manual", "ideate_ai"),
+        for sub, key, legacy_pair in (
+            (sub_ideate, "ideate", ("ideate_manual", "ideate_ai")),
+            (sub_debug, "debug", ("debug_manual", "debug_ai")),
         ):
             with sub:
-                c1, c2 = st.columns(2)
-                for col, key in ((c1, left), (c2, right)):
-                    with col:
-                        st.markdown(f"**{DOC_TITLES[key]}**")
-                        st.markdown(docs[key]["content"] if key in docs else "_missing_")
-                        with st.expander("Upload / replace"):
-                            _doc_upload_widget(sid, key, DOC_TITLES[key], key in docs)
+                st.markdown(docs[key]["content"] if key in docs else "_Not uploaded._")
+                with st.expander("Upload / replace"):
+                    _doc_upload_widget(sid, key, DOC_TITLES[key], key in docs)
+                present_legacy = [k for k in legacy_pair if k in docs]
+                if present_legacy:
+                    st.divider()
+                    st.caption(
+                        "This participant was run under the earlier protocol, which "
+                        "split this task into a manual and an AI document."
+                    )
+                    for k in present_legacy:
+                        with st.expander(DOC_TITLES[k]):
+                            st.markdown(docs[k]["content"])
+                            _doc_upload_widget(sid, k, DOC_TITLES[k], True)
+
+        with sub_timings:
+            timings = bundle.get("task_timings") or {}
+            if not timings:
+                st.caption("No task timings recorded — this participant predates timed tasks.")
+            else:
+                rows = []
+                for key in (tasks.MAIN, tasks.IDEATE, tasks.DEBUG):
+                    t = timings.get(key)
+                    if not t:
+                        continue
+                    spent = _timing_seconds(t)
+                    limit = t.get("limit_seconds")
+                    rows.append({
+                        "task": tasks.TASK_TITLE[key],
+                        "started": t.get("started_at"),
+                        "time spent": tasks.format_duration(spent),
+                        "allowance": tasks.format_duration(limit) if limit else "untimed",
+                        "over by": (
+                            tasks.format_duration(spent - limit)
+                            if limit and spent is not None and spent > limit else "—"
+                        ),
+                        "finished": "yes" if t.get("finished_at") else "still open",
+                    })
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+            extras = bundle.get("extra_files") or []
+            st.markdown("#### Additional main-task files")
+            if not extras:
+                st.caption("None uploaded.")
+            for row in sorted(extras, key=lambda r: r["filename"]):
+                c_name, c_dl, c_del = st.columns([3, 1, 1])
+                size = row.get("byte_size")
+                c_name.markdown(
+                    f"📎 `{row['filename']}`"
+                    + (f" · {size:,} bytes" if size else "")
+                )
+                c_dl.download_button(
+                    "⬇️", data=extra_file_bytes(row), file_name=row["filename"],
+                    key=f"dl_extra_{row['filename']}",
+                )
+                if c_del.button("🗑️", key=f"del_extra_{row['filename']}"):
+                    ok, err = delete_participant_extra_file(sid, row["filename"])
+                    (st.success if ok else st.error)("Deleted." if ok else f"Not deleted: {err}")
+                    if ok:
+                        st.rerun()
 
         with sub_notebook:
             if nb and nb.get("results"):
@@ -671,7 +767,12 @@ with tab_detail:
                     f"⬇️ {lg['filename']}", data=lg["raw_jsonl"],
                     file_name=lg["filename"], mime="application/json", key=f"dl_log_{lg['filename']}",
                 )
-            if not bundle["files"] and not nb and not logs:
+            for row in sorted(bundle.get("extra_files") or [], key=lambda r: r["filename"]):
+                st.download_button(
+                    f"⬇️ {row['filename']} (extra)", data=extra_file_bytes(row),
+                    file_name=row["filename"], key=f"dlraw_extra_{row['filename']}",
+                )
+            if not bundle["files"] and not nb and not logs and not bundle.get("extra_files"):
                 st.caption("No files on record.")
 
 # ---- Tab 3: Cohort statistics ----------------------------------------
@@ -684,7 +785,84 @@ with tab_surveys:
         list_participant_survey_rows(), list_participant_summaries()
     )
 
-# ---- Tab 5: Notebook grading report --------------------------------
+# ---- Tab 5: Task instructions ---------------------------------------
+with tab_tasks:
+    st.markdown(
+        "What the participant reads before each task. The main task has one "
+        "document per condition — a participant only ever sees the one matching "
+        "the condition they were assigned. Ideation and debugging are shared "
+        "across conditions."
+    )
+    st.caption(
+        "Markdown, rendered to the participant exactly as previewed here. A task "
+        "whose document is missing cannot be started, so upload all five before "
+        "running anyone."
+    )
+
+    # Saving reruns immediately to refresh the previews, which would wipe the
+    # success message before it renders — same flash trick as the Grading tab.
+    _tflash = st.session_state.pop("_task_save_msg", None)
+    if _tflash is not None:
+        (st.success if _tflash[0] else st.error)(_tflash[1])
+
+    _instructions = list_task_instructions()
+    _missing = [k for k, _ in tasks.INSTRUCTION_KEYS if k not in _instructions]
+    if _missing:
+        st.error(
+            "Not uploaded yet: "
+            + ", ".join(f"**{tasks.INSTRUCTION_TITLE[k]}**" for k in _missing)
+        )
+    else:
+        st.success("All five task documents are uploaded.")
+
+    for _key, _title in tasks.INSTRUCTION_KEYS:
+        _row = _instructions.get(_key)
+        _mark = "✅" if _row else "❌"
+        with st.expander(f"{_mark} {_title}", expanded=_row is None):
+            if _row:
+                st.caption(
+                    f"`{_key}` · last saved {_row.get('updated_at') or 'unknown'}"
+                )
+            else:
+                st.caption(f"`{_key}` · nothing uploaded yet")
+
+            _up = st.file_uploader(
+                "Upload a .md file", type=["md"], key=f"ti_up_{_key}"
+            )
+            _seed = _decode_upload(_up) if _up is not None else (
+                _row.get("content") if _row else ""
+            )
+            _heading = st.text_input(
+                "Heading shown above the instructions (optional)",
+                value=(_row.get("title") or "") if _row else "",
+                key=f"ti_title_{_key}",
+            )
+            _body = st.text_area(
+                "Instructions (markdown)", value=_seed or "", height=280,
+                key=f"ti_body_{_key}",
+            )
+            if _body.strip():
+                with st.expander("Preview as the participant sees it"):
+                    if _heading.strip():
+                        st.markdown(f"### {_heading.strip()}")
+                    st.markdown(_body)
+
+            c_save, c_del = st.columns([3, 1])
+            if c_save.button("Save", type="primary", key=f"ti_save_{_key}",
+                             disabled=not _body.strip()):
+                ok, err = save_task_instruction(_key, _body, _heading)
+                st.session_state["_task_save_msg"] = (
+                    ok, f"Saved {_title}." if ok else f"Not saved: {err}"
+                )
+                st.rerun()
+            if _row and c_del.button("🗑️ Delete", key=f"ti_del_{_key}"):
+                ok, err = delete_task_instruction(_key)
+                st.session_state["_task_save_msg"] = (
+                    ok, f"Deleted {_title}." if ok else f"Not deleted: {err}"
+                )
+                st.rerun()
+
+# ---- Tab 6: Notebook grading report --------------------------------
 with tab_report:
     st.markdown(
         "Visual review of every graded participant notebook: score distribution, "
@@ -705,7 +883,7 @@ with tab_report:
         # Isolated iframe: the report ships its own CSS reset + tooltip script.
         components.html(report_html, height=2200, scrolling=True)
 
-# ---- Tab 6: Grading & rubric ----------------------------------------
+# ---- Tab 7: Grading & rubric ----------------------------------------
 with tab_grading:
     st.markdown(
         f"New submissions are auto-graded against the rubric named **`{ACTIVE_RUBRIC_NAME}`** "

@@ -19,47 +19,57 @@ The app opens at http://localhost:8501 with two pages:
 
 | Page | Who | What |
 |---|---|---|
-| **Participant** | study participants | Part 1: subject ID + condition, upload the notebook, take the quiz. Part 2 (later, same ID): upload the reflection files + session log. **No scores are ever shown.** |
+| **Participant** | study participants | The whole session in order: surveys, three timed tasks with uploads, the quiz, and an interview hand-off. **No scores are ever shown.** |
 | **Admin** | the researcher (password-gated) | per-participant review, cohort statistics, grading controls |
 
 `app.py` is the `st.navigation` router. Page shells live in `app_pages/`; all the
-real logic is in `lib/` (`notebook`, `quiz`, `quiz_ui`, `grading`, `timeline`,
-`cohort`, `llm`). `db.py` is the shared Supabase integration. `build_report.py`
+real logic is in `lib/` (`notebook`, `quiz`, `quiz_ui`, `surveys`, `survey_ui`,
+`survey_stats`, `tasks`, `grading`, `timeline`, `cohort`, `llm`). `db.py` is the shared Supabase integration. `build_report.py`
 is an optional CLI that renders a standalone HTML grading report.
 
 ---
 
 ## Participant flow (`app_pages/participant.py`)
 
-A **two-part** flow, both parts keyed to the same subject ID (`P` + 3 digits, e.g.
-`P001`). The page routes on the participant's stored status when they enter their ID.
+One continuous run, keyed to a subject ID (`P` + 3 digits, e.g. `P001`). Each
+screen the participant reaches is written to `participants.stage`, so re-entering
+the same ID resumes **exactly** where they stopped — including a task clock that
+was already running.
 
-**Part 1 — right after the coding task:**
+| # | Stage | What happens |
+|---|---|---|
+| — | `identify` | Subject ID + the condition assigned in person (typed as text, normalised to `slow_planning` / `slow_iterating` / `control`). |
+| 1 | `pre_survey` | The opening survey (`lib/surveys.py`). Every question is required. |
+| 2 | `main_task` | The main-task document **for their condition**, then a **40-minute** countdown. |
+| 2 | `main_upload` | `Pxxx_task_plan.md` + `Pxxx_notebook.ipynb` (exact names), plus any number of extra files under any name. |
+| 3 | `ideate_task` | The ideation document. **Untimed** — the clock counts up and the duration is recorded. |
+| 3 | `ideate_upload` | `Pxxx_ideate.md`. |
+| 4 | `quiz` | The notebook-comprehension quiz (below). No score is shown. Status → `quiz_done`. |
+| 5 | `interview` | Hand-off screen: the participant answers questions verbally with the researcher. Nothing to upload. |
+| 6 | `debug_task` | The debugging document, then a **15-minute** countdown. |
+| 6 | `debug_upload` | `Pxxx_debug.md`. |
+| 7 | `log_upload` | `Pxxx_claude_log.jsonl` — several sessions are fine (`Pxxx_claude_log_2.jsonl`, …). |
+| 8 | `post_survey` | The closing survey, then hidden grading runs and status → `complete`. |
 
-1. **Identify** — enter the subject ID and the condition assigned in person (typed
-   as text, normalised to `slow_planning` / `slow_iterating` / `control`).
-2. **Notebook** — upload only `Pxxx_notebook.ipynb` (exact name required). The
-   transcript is stored.
-3. **Quiz** — the notebook-comprehension quiz (see below) runs in-app. The
-   participant never sees a score or breakdown.
-4. **Finalize** — the notebook is graded synchronously against the active rubric
-   behind a neutral spinner; grading failures are recorded for the admin, never
-   shown. Status → `quiz_done`. The participant can go straight to Part 2 or leave.
+**Task instructions are uploaded by the researcher** in Admin → Task instructions:
+one main-task document per condition plus the shared ideation and debugging ones.
+A task whose document is missing cannot be started.
 
-**Part 2 — any time later:**
+**Timers are advisory.** The countdown (`lib/tasks.py`) runs client-side in a
+same-origin iframe, beeps twice when the allowance runs out, and then keeps
+counting into overtime — nothing is locked, and the participant can still finish
+and upload. It is anchored to a `started_at` stored in the database, so a refresh
+or a dropped connection never hands anyone a fresh allowance; overtime is recorded
+for the researcher in Admin → Task timing.
 
-Re-enter the same subject ID → the page detects `quiz_done` and asks for the
-remaining **6 files**, each named `{subject_id}_<name>` exactly:
+Every upload screen checks names and blocks Submit until they match, so files
+always arrive keyed to the right participant.
 
-- `Pxxx_task_plan.md`
-- `Pxxx_debug_manual.md`, `Pxxx_debug_ai.md`
-- `Pxxx_ideate_manual.md`, `Pxxx_ideate_ai.md`
-- `Pxxx_claude_log.jsonl`
-
-A file check lists ✅ found / ❌ missing / 🚫 unexpected; **Submit is blocked until
-exactly those 6 correctly-named files are selected.** The notebook is never
-re-uploaded. The five docs plus the raw session log (and its derived behaviour
-metrics) are saved, and status → `complete`.
+> **Earlier protocol.** Participants run before this flow have their reflection
+> documents split into manual and AI versions (`Pxxx_debug_manual.md`,
+> `Pxxx_debug_ai.md`, `Pxxx_ideate_manual.md`, `Pxxx_ideate_ai.md`). Nothing
+> writes those any more — new runs collect one `ideate` and one `debug` document
+> — but Admin still displays and can replace them.
 
 ## Comprehension quiz
 
@@ -108,21 +118,32 @@ a "Re-parse all logs" button to recompute stored metrics after a parser change.
 
 ## Admin (`app_pages/admin.py`)
 
-Password gate (`ADMIN_PASSWORD`). Four tabs:
+Password gate (`ADMIN_PASSWORD`). Seven tabs:
 
 1. **Overview** — one row per participant (condition, scores, log metrics, grading
    status); filter by condition; download all as CSV.
-2. **Participant** — the five markdown docs (manual vs AI side by side), the graded
-   notebook (per-item scores + reasoning + transcript), the quiz breakdown, the
-   **verbal assessment** (upload a `.txt` transcript → Claude splits it into
-   timestamped question/answer pairs; not scored), the interactive session timeline
-   with click-to-open event detail, and raw file downloads. A "Grade now" button for
+2. **Participant** — this participant's surveys (with ✅/❌ on the scored knowledge
+   items), **task timing** (time spent vs allowance, plus any extra main-task
+   files), the task plan / ideation / debugging documents, the graded notebook
+   (per-item scores + reasoning + transcript), the quiz breakdown, the **verbal
+   assessment** (upload a `.txt` transcript → Claude splits it into timestamped
+   question/answer pairs; not scored), the interactive session timeline with
+   click-to-open event detail, and raw file downloads. A "Grade now" button for
    anything still ungraded.
 3. **Cohort stats** — outcome and behaviour metrics overall and split by condition
    (box + strip plots), a per-condition n / mean / sd table with a hand-rolled
    one-way ANOVA (F, p, η² — descriptive only), the manipulation checks, and a
    quiz-vs-notebook scatter coloured by condition.
-4. **Grading & rubric** — the active rubric, upload/replace a rubric CSV + task
+4. **Survey results** — the pre/post surveys across every participant
+   (`lib/survey_stats.py`): coverage and timing, pre→post knowledge gain scored
+   against `lib.surveys.ANSWER_KEY`, attitude shift, workload, self-assessed vs
+   rubric grade, background, free text, and a long-format CSV export.
+5. **Task instructions** — upload the markdown each task screen shows: one
+   main-task document per condition (slow planning / slow iterating / control)
+   plus the shared ideation and debugging ones. **Upload all five before running
+   anyone** — a task with no document cannot be started.
+6. **Notebook report** — the visual grading report across all graded notebooks.
+7. **Grading & rubric** — the active rubric, upload/replace a rubric CSV + task
    text, and "grade all pending participants".
 
 ---
@@ -135,10 +156,15 @@ study needs it configured.
 
 Tables (`supabase_schema.sql`):
 
-- `participants` — identity, condition, submission + grading status
-- `participant_files` — the 5 markdown docs (one row per `doc_type`)
+- `participants` — identity, condition, resume `stage`, submission + grading status
+- `participant_files` — the per-task markdown docs (one row per `doc_type`)
+- `participant_extra_files` — anything extra attached to the main task (binaries
+  are base64'd, which `encoding` records)
 - `participant_notebooks` — the `.ipynb` transcript + its rubric grading
 - `participant_quiz` — the comprehension-quiz result + per-question breakdown
+- `participant_surveys` — the pre/post survey responses + per-item timing
+- `participant_task_timings` — when each timed task was started and finished
+- `task_instructions` — the admin-authored markdown for each task screen
 - `participant_logs` — the raw session `.jsonl` + derived metrics
 - `participant_transcripts` — the admin-uploaded verbal-assessment `.txt` + its
   parsed timestamped Q/A pairs
