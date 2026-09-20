@@ -175,6 +175,21 @@ create table if not exists participant_quiz (
 
 alter table participant_quiz enable row level security;
 
+-- The pre-survey (taken right at the start, before the notebook) and the
+-- post-survey (taken after Part 2 materials are uploaded). Content is fixed --
+-- transcribed from the study's Qualtrics PDFs, see lib/surveys.py -- never
+-- shown a score, same spirit as participant_quiz.
+create table if not exists participant_surveys (
+  subject_id text not null references participants (subject_id) on delete cascade,
+  survey_type text not null,          -- 'pre' | 'post'
+  responses jsonb not null,           -- [{"item_id","category","question","answer","time_spent_seconds"}, ...]
+  elapsed_seconds numeric,            -- total time across the whole survey
+  created_at timestamptz not null default now(),
+  primary key (subject_id, survey_type)
+);
+
+alter table participant_surveys enable row level security;
+
 -- A participant can have more than one session-log file (e.g. separate work
 -- sessions) -- the key is (subject_id, filename), not subject_id alone.
 create table if not exists participant_logs (

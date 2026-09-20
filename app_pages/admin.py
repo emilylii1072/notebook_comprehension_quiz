@@ -1,18 +1,27 @@
 """Admin — the researcher's view of every participant.
 
-Password-gated (set ADMIN_PASSWORD in secrets / .env). Five top-level tabs:
+Password-gated (set ADMIN_PASSWORD in secrets / .env). Six top-level tabs:
   1. Overview        — one row per participant, filter by condition, CSV export
-  2. Participant     — sub-tabs per task/data type: Task plan, Debug (manual vs
-                       AI), Ideate (manual vs AI), Notebook grade, Quiz, Verbal
-                       assessment, Session timeline, Raw files. Session timeline
+  2. Participant     — sub-tabs per task/data type: Surveys, Task plan, Debug
+                       (manual vs AI), Ideate (manual vs AI), Notebook grade,
+                       Quiz, Verbal assessment, Session timeline, Raw files.
+                       Surveys shows this one participant's pre-/post-survey
+                       (lib/surveys.py, transcribed from the study's Qualtrics
+                       PDFs) with per-item timing and ✅/❌ on the scored
+                       knowledge items, read-only. Session timeline
                        carries per-turn behaviour tagging (phase / delegation
                        posture / trust) via an "Annotate" button, shown in place
                        as 💬 popovers. Verbal assessment carries a "Fact-check"
                        button instead — it tags each spoken answer's accuracy
                        against the participant's own notebook, not behaviour.
   3. Cohort stats    — outcomes + behaviour overall and split by condition
-  4. Notebook report — the visual grading report across all graded notebooks
-  5. Grading         — browse/upload any rubric version, grade or re-grade
+  4. Survey results  — the pre/post surveys across every participant
+                       (lib/survey_stats.py): coverage and timing, knowledge
+                       gain against lib.surveys.ANSWER_KEY, attitude shift,
+                       workload, self-assessed vs rubric grade, background,
+                       free text, and a long-format CSV export
+  5. Notebook report — the visual grading report across all graded notebooks
+  6. Grading         — browse/upload any rubric version, grade or re-grade
                        (individually or in bulk) against whichever one you pick;
                        also hosts "Annotate everything pending" (lib/annotate.py),
                        the cross-participant bulk version of the turn tagging above
@@ -41,6 +50,7 @@ from db import (
     list_notebook_section_scores,
     list_participant_logs_raw,
     list_participant_summaries,
+    list_participant_survey_rows,
     list_participant_transcripts_raw,
     list_pending_grading,
     list_rubrics,
@@ -55,10 +65,11 @@ from db import (
     supabase_status,
     update_participant_grading,
 )
-from lib import annotate, cohort, grading, transcript
+from lib import annotate, cohort, grading, survey_stats, transcript
 from lib.llm import get_client
 from lib.notebook import notebook_to_text
 from lib.quiz_ui import render_quiz_breakdown
+from lib.survey_ui import render_survey_breakdown
 from lib.timeline import (
     compute_log_metrics,
     merge_parsed,
@@ -295,9 +306,9 @@ def _notebook_upload_widget(sid: str, exists: bool) -> None:
                 st.rerun()
 
 
-tab_overview, tab_detail, tab_cohort, tab_report, tab_grading = st.tabs(
-    ["1 · Overview", "2 · Participant", "3 · Cohort stats",
-     "4 · Notebook report", "5 · Grading & rubric"]
+tab_overview, tab_detail, tab_cohort, tab_surveys, tab_report, tab_grading = st.tabs(
+    ["1 · Overview", "2 · Participant", "3 · Cohort stats", "4 · Survey results",
+     "5 · Notebook report", "6 · Grading & rubric"]
 )
 
 _section_rows = list_notebook_section_scores()  # (participant, section) grades; used in tabs 2 & 3
@@ -359,12 +370,17 @@ with tab_detail:
         logs = bundle["logs"]
 
         (
-            sub_taskplan, sub_debug, sub_ideate,
+            sub_surveys, sub_taskplan, sub_debug, sub_ideate,
             sub_notebook, sub_quiz, sub_verbal, sub_timeline, sub_files,
         ) = st.tabs([
-            "Task plan", "Debug: manual vs AI", "Ideate: manual vs AI",
+            "Surveys", "Task plan", "Debug: manual vs AI", "Ideate: manual vs AI",
             "Notebook grade", "Quiz", "Verbal assessment", "Session timeline", "Raw files",
         ])
+
+        with sub_surveys:
+            render_survey_breakdown(bundle["pre_survey"], "Pre-survey")
+            st.divider()
+            render_survey_breakdown(bundle["post_survey"], "Post-survey")
 
         with sub_taskplan:
             if "task_plan" in docs:
@@ -662,7 +678,13 @@ with tab_detail:
 with tab_cohort:
     cohort.render_cohort(list_participant_summaries(), _section_rows)
 
-# ---- Tab 4: Notebook grading report --------------------------------
+# ---- Tab 4: Survey results (cohort) ----------------------------------
+with tab_surveys:
+    survey_stats.render_survey_cohort(
+        list_participant_survey_rows(), list_participant_summaries()
+    )
+
+# ---- Tab 5: Notebook grading report --------------------------------
 with tab_report:
     st.markdown(
         "Visual review of every graded participant notebook: score distribution, "
@@ -683,7 +705,7 @@ with tab_report:
         # Isolated iframe: the report ships its own CSS reset + tooltip script.
         components.html(report_html, height=2200, scrolling=True)
 
-# ---- Tab 5: Grading & rubric ----------------------------------------
+# ---- Tab 6: Grading & rubric ----------------------------------------
 with tab_grading:
     st.markdown(
         f"New submissions are auto-graded against the rubric named **`{ACTIVE_RUBRIC_NAME}`** "

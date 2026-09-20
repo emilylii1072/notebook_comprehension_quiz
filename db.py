@@ -374,7 +374,7 @@ def upsert_participant(subject_id: str, condition: str) -> tuple[bool, str | Non
     try:
         for table in ("participant_files", "participant_notebooks",
                       "participant_quiz", "participant_logs",
-                      "participant_turn_annotations"):
+                      "participant_turn_annotations", "participant_surveys"):
             client.table(table).delete().eq("subject_id", subject_id).execute()
         client.table("participants").upsert(
             {
@@ -527,6 +527,51 @@ def save_participant_quiz(subject_id: str, payload: dict) -> tuple[bool, str | N
         return False, str(e)
 
 
+def save_participant_survey(
+    subject_id: str, survey_type: str, responses: list[dict], elapsed_seconds: float | None
+) -> tuple[bool, str | None]:
+    """Upsert one participant's pre- or post-survey responses (survey_type is
+    'pre' or 'post'). `responses` is the full per-item list -- see
+    lib.surveys.SurveyItem / lib.survey_ui for the shape."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_surveys").upsert(
+            {
+                "subject_id": subject_id,
+                "survey_type": survey_type,
+                "responses": responses,
+                "elapsed_seconds": elapsed_seconds,
+            },
+            on_conflict="subject_id,survey_type",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_participant_survey(subject_id: str, survey_type: str) -> dict | None:
+    """Fetch one participant's pre- or post-survey record, or None if they
+    haven't taken it yet. Used both to resume-skip a completed survey and by
+    Admin to display it."""
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        resp = (
+            client.table("participant_surveys")
+            .select("*")
+            .eq("subject_id", subject_id).eq("survey_type", survey_type)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return None
+    rows = resp.data or []
+    return rows[0] if rows else None
+
+
 def save_participant_log(
     subject_id: str, filename: str, raw_jsonl: str, metrics: dict
 ) -> tuple[bool, str | None]:
@@ -665,7 +710,7 @@ def get_participant_bundle(subject_id: str) -> dict:
     client = get_supabase_client()
     empty = {
         "participant": None, "files": [], "notebook": None, "quiz": None,
-        "logs": [], "transcript": None,
+        "logs": [], "transcript": None, "pre_survey": None, "post_survey": None,
     }
     if client is None:
         return empty
@@ -696,6 +741,8 @@ def get_participant_bundle(subject_id: str) -> dict:
             .eq("subject_id", subject_id).limit(1).execute().data or []
         )
         out["transcript"] = tr[0] if tr else None
+        out["pre_survey"] = get_participant_survey(subject_id, "pre")
+        out["post_survey"] = get_participant_survey(subject_id, "post")
     except Exception:
         pass
     return out
@@ -1027,3 +1074,42 @@ def list_pending_grading(include_graded: bool = False) -> list[dict]:
         return q.execute().data or []
     except Exception:
         return []
+
+
+def list_participant_survey_rows() -> list[dict]:
+    """[{subject_id, condition, survey_type, elapsed_seconds, item_id, category,
+    question, answer, time_spent_seconds}] — one row per (participant, survey
+    item), for the cohort survey visualisations and the survey CSV export.
+
+    Flattened here rather than in the chart layer so the admin gets the same
+    long-format table it downloads."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+    try:
+        conds = {
+            r["subject_id"]: r.get("condition")
+            for r in (client.table("participants")
+                      .select("subject_id,condition").execute().data or [])
+        }
+        surveys = (
+            client.table("participant_surveys")
+            .select("subject_id,survey_type,responses,elapsed_seconds").execute().data or []
+        )
+    except Exception:
+        return []
+    out = []
+    for s in surveys:
+        for r in s.get("responses") or []:
+            out.append({
+                "subject_id": s["subject_id"],
+                "condition": conds.get(s["subject_id"]),
+                "survey_type": s.get("survey_type"),
+                "elapsed_seconds": s.get("elapsed_seconds"),
+                "item_id": r.get("item_id"),
+                "category": r.get("category"),
+                "question": r.get("question"),
+                "answer": r.get("answer"),
+                "time_spent_seconds": r.get("time_spent_seconds"),
+            })
+    return out
