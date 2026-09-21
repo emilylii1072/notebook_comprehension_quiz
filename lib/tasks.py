@@ -55,12 +55,10 @@ INSTRUCTION_TITLE = dict(INSTRUCTION_KEYS)
 
 # Admin-only grading material for the debugging task, kept in task_instructions
 # beside the participant-facing documents but never shown to a participant and
-# deliberately not in INSTRUCTION_KEYS (a task can start without them).
+# deliberately not in INSTRUCTION_KEYS (a task can start without it).
 # DEBUG_NOTEBOOK_KEY: the buggy notebook, flattened by lib.notebook.notebook_to_text
-# (title = the uploaded filename). DEBUG_ANSWER_KEY: the markdown list of the
-# bugs planted in it, which every write-up is graded against.
+# (title = the uploaded filename), which the grader reads each write-up against.
 DEBUG_NOTEBOOK_KEY = "debug_notebook"
-DEBUG_ANSWER_KEY = "debug_answer_key"
 # The rubric the ideation pitch transcript is scored against, verbatim.
 IDEATE_RUBRIC_KEY = "ideate_rubric"
 

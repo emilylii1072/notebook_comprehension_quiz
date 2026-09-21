@@ -6,9 +6,10 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Seven top-level tabs:
                        plan, Ideate, Debug, Notebook grade, Quiz, Verbal
                        assessment, Session timeline, Raw files.
                        Debug and Ideate each have an Autograde block. Debug: the
-                       write-up is scored 0-2 per bug against an answer key drawn
-                       from the buggy notebook the admin uploads under Task
-                       instructions. Ideate: participants upload nothing; the
+                       write-up is read against the buggy notebook the admin uploads
+                       under Task instructions; each bug the participant reported
+                       scores +1 if it is a real bug and +1 if the fix is valid.
+                       Ideate: participants upload nothing; the
                        admin uploads a transcript of their spoken pitch, scored
                        against an admin-uploaded rubric (Task instructions).
                        Task timing shows how long each timed task actually took
@@ -250,12 +251,9 @@ def _grade_task_for(subject_id: str, task_key: str, text: str) -> tuple[bool, st
     try:
         if task_key == tasks.DEBUG:
             nb_row = get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY)
-            key_row = get_task_instruction(tasks.DEBUG_ANSWER_KEY)
-            if not nb_row or not _has_text(key_row):
-                return False, "upload the buggy notebook and its answer key under Task instructions first"
-            graded = debug_grading.grade_debug_writeup(
-                get_client(), nb_row["content"], key_row["content"], text
-            )
+            if not nb_row:
+                return False, "upload the buggy notebook under Task instructions first"
+            graded = debug_grading.grade_debug_writeup(get_client(), nb_row["content"], text)
             results, notes, model = graded["results"], graded["notes"], debug_grading.MODEL
         else:
             rubric_row = get_task_instruction(tasks.IDEATE_RUBRIC_KEY)
@@ -281,12 +279,10 @@ def _render_task_grade(sid: str, task_key: str, doc: dict | None) -> None:
     transcript: the stored grade if any, and a (re-)grade button once the admin's
     grading material for that task is in place."""
     if task_key == tasks.DEBUG:
-        ready = get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY) is not None and _has_text(
-            get_task_instruction(tasks.DEBUG_ANSWER_KEY)
-        )
+        ready = get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY) is not None
         setup = (
-            "To autograde, upload the buggy notebook and set its answer key under "
-            "Task instructions → Debugging task — grading material."
+            "To autograde, upload the buggy notebook under Task instructions → "
+            "Debugging task — grading material."
         )
         missing_doc = "No debugging write-up to grade."
     else:
@@ -301,13 +297,16 @@ def _render_task_grade(sid: str, task_key: str, doc: dict | None) -> None:
     grade = get_task_grade(sid, task_key)
     if grade:
         st.metric("Total", f"{grade['total_score']:g} / {grade['max_score']:g}")
-        st.dataframe(
-            pd.DataFrame(grade["results"])[["criterion", "score", "max_pts", "reasoning"]],
-            hide_index=True, width="stretch",
-        )
+        if grade["results"]:
+            st.dataframe(
+                pd.DataFrame(grade["results"])[["criterion", "score", "max_pts", "reasoning"]],
+                hide_index=True, width="stretch",
+            )
+        else:
+            st.caption("No bugs were reported in this write-up.")
         if grade.get("notes"):
             st.caption(f"Other reports: {grade['notes']}")
-        st.caption(f"Graded {grade.get('graded_at') or ''} against the grading material as it stood then.")
+        st.caption(f"Graded {grade.get('graded_at') or ''} against the notebook as it stood then.")
     if not ready:
         st.caption(setup)
     elif doc is None or not (doc.get("content") or "").strip():
@@ -987,24 +986,23 @@ with tab_tasks:
                 )
                 st.rerun()
 
-    # -- Debugging task: the buggy notebook + answer key, for autograding ------
+    # -- Debugging task: the buggy notebook, for autograding ------
     st.divider()
     st.markdown("### 🐞 Debugging task — grading material")
     st.caption(
         "Admin only — never shown to a participant. Upload the buggy notebook "
-        "participants debug, then set its answer key: the list of bugs every "
-        "debugging write-up is scored against (0–2 per bug). One shared key keeps "
-        "scores comparable across participants."
+        "participants debug. Claude reads it alongside each write-up, finds every bug "
+        "the participant reported, and scores each one: +1 if it is a real bug, +1 if "
+        "the fix is valid (max 2 per reported bug)."
     )
     _dbg_nb = _instructions.get(tasks.DEBUG_NOTEBOOK_KEY)
-    _dbg_key = _instructions.get(tasks.DEBUG_ANSWER_KEY)
 
     with st.expander(f"{'✅' if _dbg_nb else '❌'} Buggy notebook", expanded=_dbg_nb is None):
         if _dbg_nb:
             st.caption(
                 f"`{_dbg_nb.get('title') or 'notebook'}` · last saved "
-                f"{_dbg_nb.get('updated_at') or 'unknown'}. Replacing it does not change "
-                "the answer key below or regrade anyone — update the key, then re-grade."
+                f"{_dbg_nb.get('updated_at') or 'unknown'}. Replacing it does not regrade "
+                "anyone — use Re-grade on each participant."
             )
         _dbg_up = st.file_uploader("Upload the buggy notebook (.ipynb)", type=["ipynb"], key="dbg_nb_up")
         if _dbg_up is not None and st.button("Save notebook", type="primary", key="dbg_nb_save"):
@@ -1030,54 +1028,6 @@ with tab_tasks:
                     ok, "Deleted the buggy notebook." if ok else f"Not deleted: {err}"
                 )
                 st.rerun()
-
-    with st.expander(f"{'✅' if _dbg_key else '❌'} Answer key", expanded=_dbg_nb is not None and _dbg_key is None):
-        # The editor's text lives in session state so "Generate" and "Load file" can
-        # fill it in for review; a rerun applies that before the widget is created.
-        _draft = st.session_state.pop("_dbg_key_draft", None)
-        if _draft is not None:
-            st.session_state["dbg_key_body"] = _draft
-        elif "dbg_key_body" not in st.session_state:
-            st.session_state["dbg_key_body"] = _dbg_key["content"] if _dbg_key else ""
-        if _dbg_key:
-            st.caption(f"Last saved {_dbg_key.get('updated_at') or 'unknown'}.")
-        st.caption(
-            "One bug per numbered item — title, where (cell number, using the numbering "
-            "in the flattened notebook above), what's wrong, and the fix. Edit freely; "
-            "nothing is used for grading until you Save."
-        )
-        _c_gen, _c_file = st.columns(2)
-        if _c_gen.button(
-            "✨ Draft from the notebook", key="dbg_key_gen", disabled=_dbg_nb is None,
-            help="Has Opus 5 read the buggy notebook and propose the list. Replaces the editor's text, not the saved key.",
-        ):
-            with st.spinner("Reading the notebook…"):
-                _gen = debug_grading.call_with_errors_surfaced(
-                    debug_grading.generate_answer_key, get_client(), _dbg_nb["content"]
-                )
-            if _gen is not None:
-                st.session_state["_dbg_key_draft"] = _gen
-                st.rerun()
-        _key_up = _c_file.file_uploader("…or load a .md file", type=["md"], key="dbg_key_up")
-        if _key_up is not None and _c_file.button("Load into editor", key="dbg_key_load"):
-            st.session_state["_dbg_key_draft"] = _decode_upload(_key_up)
-            st.rerun()
-        _key_body = st.text_area("Answer key (markdown)", height=320, key="dbg_key_body")
-        _c_ksave, _c_kdel = st.columns([3, 1])
-        if _c_ksave.button("Save answer key", type="primary", key="dbg_key_save", disabled=not _key_body.strip()):
-            ok, err = save_task_instruction(tasks.DEBUG_ANSWER_KEY, _key_body, "Debugging answer key")
-            st.session_state["_task_save_msg"] = (
-                ok, "Saved the answer key. Re-grade participants to score them against it."
-                if ok else f"Not saved: {err}"
-            )
-            st.rerun()
-        if _dbg_key and _c_kdel.button("🗑️ Delete", key="dbg_key_del"):
-            ok, err = delete_task_instruction(tasks.DEBUG_ANSWER_KEY)
-            st.session_state.pop("dbg_key_body", None)
-            st.session_state["_task_save_msg"] = (
-                ok, "Deleted the answer key." if ok else f"Not deleted: {err}"
-            )
-            st.rerun()
 
     # -- Ideation task: the rubric its pitch transcripts are graded against ------
     st.divider()

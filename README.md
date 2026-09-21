@@ -143,9 +143,10 @@ Password gate (`ADMIN_PASSWORD`). Seven tabs:
    main-task document per condition (slow planning / slow iterating / control)
    plus the shared ideation and debugging ones. **Upload all five before running
    anyone** — a task with no document cannot be started. Below them, the grading material (admin only):
-   the **debugging** buggy `.ipynb` plus its **answer key** (draft it with Opus 5, edit,
-   save), and the **ideation rubric**. A participant's Debug sub-tab then autogrades
-   their write-up 0–2 per key bug (`lib/debug_grading.py`), and their Ideate sub-tab
+   the **debugging** buggy `.ipynb` and the **ideation rubric**. A participant's Debug
+   sub-tab then autogrades their write-up (`lib/debug_grading.py`): Opus 5 reads the
+   notebook and the write-up, and each bug the participant reported scores +1 if it is
+   a real bug and +1 if the fix is valid (so the max is 2 × bugs reported). Their Ideate sub-tab
    grades the pitch transcript against the rubric, read verbatim
    (`lib/ideate_grading.py`); results go to `participant_task_grades`.
 6. **Notebook report** — the visual grading report across all graded notebooks.
@@ -169,7 +170,7 @@ Tables (`supabase_schema.sql`):
 - `participant_notebooks` — the `.ipynb` transcript + its rubric grading
 - `participant_task_grades` — the autograde of a participant's debugging write-up
   or ideation pitch transcript, one row per (participant, task). The grading material
-  is `task_instructions` rows: `debug_notebook`, `debug_answer_key`, `ideate_rubric`.
+  is `task_instructions` rows: `debug_notebook`, `ideate_rubric`.
 - `participant_quiz` — the comprehension-quiz result + per-question breakdown
 - `participant_surveys` — the pre/post survey responses + per-item timing
 - `participant_task_timings` — when each timed task was started and finished

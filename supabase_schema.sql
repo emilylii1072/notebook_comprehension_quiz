@@ -385,9 +385,8 @@ alter table participants add column if not exists stage text;
 -- Autograde of a participant's debugging write-up or ideation pitch transcript
 -- (participant_files, doc_type 'debug' / 'ideate') -- see lib/debug_grading.py and
 -- lib/ideate_grading.py. One row per (participant, task). The grading material
--- itself lives in task_instructions: the buggy notebook and its answer key
--- ('debug_notebook' / 'debug_answer_key') and the ideation rubric
--- ('ideate_rubric'), so it needs no table of its own.
+-- itself lives in task_instructions: the buggy notebook ('debug_notebook') and
+-- the ideation rubric ('ideate_rubric'), so it needs no table of its own.
 create table if not exists participant_task_grades (
   subject_id text not null references participants (subject_id) on delete cascade,
   task_key text not null,            -- 'debug' | 'ideate'

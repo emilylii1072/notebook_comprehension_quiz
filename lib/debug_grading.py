@@ -2,13 +2,15 @@
 
 Participants are handed a section of a coworker's notebook that "performs too well"
 and write a ranked list of the bugs they find, each with a location and a fix. The
-admin uploads that buggy notebook (Admin > Task instructions); this module turns it
-into an answer key and grades each participant's write-up against the key.
+admin uploads that buggy notebook (Admin > Task instructions); Claude reads it and
+the participant's write-up, pulls out every bug the participant reported, and scores
+each one:
 
-The answer key is one shared, admin-editable list, not something re-derived per
-participant: if every write-up were graded against whatever bugs the model happened
-to spot that time, the number of bugs — and so the maximum score — could differ
-between participants and the scores wouldn't be comparable.
+  +1  the reported bug is a genuine bug in the notebook
+  +1  the proposed fix is a valid fix for it
+
+There is no answer key: the model judges each reported bug on its own merits, so the
+maximum score is 2 x the number of bugs the participant reported.
 """
 
 from anthropic import Anthropic
@@ -20,20 +22,10 @@ MODEL = "claude-opus-5"
 MAX_PTS_PER_BUG = 2
 
 
-class KeyBug(BaseModel):
-    title: str
-    location: str
-    problem: str
-    fix: str
-
-
-class AnswerKey(BaseModel):
-    bugs: list[KeyBug]
-
-
 class BugGrade(BaseModel):
-    bug: str
-    score: int
+    bug: str              # short title of the bug as the participant reported it
+    is_real_bug: bool     # +1
+    fix_is_valid: bool    # +1
     reasoning: str
 
 
@@ -76,91 +68,64 @@ _TASK_CONTEXT = (
 )
 
 
-_KEY_SYSTEM = (
-    "You are an expert data scientist reviewing a notebook that a research study "
-    "gave participants to debug.\n\n" + _TASK_CONTEXT + "\n\n"
-    "List the genuine bugs in the notebook below — the flaws that make its results "
-    "misleading or invalid (for example data leakage, how the target/label is "
-    "constructed, how the data is split, how it is evaluated, class imbalance) — "
-    "most consequential first. For each: a short title, the cell number(s) where it "
-    "occurs, what is wrong and why it matters, and the fix. Only list real, "
-    "defensible bugs that you can point to in the code; do not pad the list with "
-    "style nits or speculation, and do not invent bugs. An admin will review and "
-    "edit your list before it is used to grade anyone."
-)
-
-
-def generate_answer_key(client: Anthropic, buggy_notebook_text: str) -> str:
-    """Draft the answer key for the buggy notebook, as markdown the admin edits and
-    saves. Cell numbers refer to the `--- ... cell N ---` markers of the flattened
-    notebook (lib.notebook.notebook_to_text)."""
-    key = _parse(
-        client, _KEY_SYSTEM,
-        f"===== BEGIN NOTEBOOK =====\n{buggy_notebook_text}\n===== END NOTEBOOK =====",
-        AnswerKey, max_tokens=8000, what="review this notebook",
-    )
-    if not key.bugs:
-        raise RuntimeError("The model found no bugs in this notebook — check that it is the buggy one.")
-    return "\n\n".join(
-        f"{i}. **{b.title.strip()}** — {b.location.strip()}\n"
-        f"   - Problem: {b.problem.strip()}\n"
-        f"   - Fix: {b.fix.strip()}"
-        for i, b in enumerate(key.bugs, 1)
-    )
-
-
-def _grade_system(buggy_notebook_text: str, answer_key: str) -> str:
+def _grade_system(buggy_notebook_text: str) -> str:
     return (
-        "You grade one participant's debugging write-up against a fixed answer key, "
-        "strictly and consistently.\n\n" + _TASK_CONTEXT + "\n\n"
-        "## The buggy notebook they were given\n"
+        "You are an expert data scientist grading one participant's debugging "
+        "write-up, strictly and consistently.\n\n" + _TASK_CONTEXT + "\n\n"
+        "## The notebook they were given\n"
+        "Cell numbers refer to the `--- ... cell N ---` markers.\n"
         f"{buggy_notebook_text}\n\n"
-        "## Answer key (the bugs to look for)\n"
-        f"{answer_key}\n\n"
         "## Grading rules\n"
-        "Return one item per bug in the answer key, in the key's order, copying the "
-        "bug's title into `bug`. Score each on a 2-point scale:\n"
-        "- 2: the write-up identifies this bug (the right problem, in the right place) "
-        "AND gives a fix that would actually resolve it.\n"
-        "- 1: partly there — it names the problem only vaguely or in the wrong place, "
-        "or it diagnoses it correctly but gives no fix or one that would not resolve it.\n"
-        "- 0: the bug is not identified (or an empty write-up).\n"
+        "Read the write-up and list every distinct bug the participant reported, in "
+        "the order they wrote them, one item per bug (if two entries describe the "
+        "same underlying bug, count it once; if one entry bundles several separate "
+        "bugs, split it). Copy or condense the participant's own title for the bug "
+        "into `bug`. Then score each item on two independent yes/no points:\n"
+        "- `is_real_bug` (+1): the reported issue is a genuine bug in the notebook — "
+        "a flaw you can point to in the code that makes its results misleading or "
+        "invalid (data leakage, how the target/label is built, how the data is split, "
+        "how it is evaluated, class imbalance, and so on). No: it is not actually "
+        "wrong, is only a style nit or speculation, or does not apply to this code.\n"
+        "- `fix_is_valid` (+1): the fix the participant proposed would actually "
+        "resolve that bug. No: there is no fix, it is too vague to act on, or it would "
+        "not resolve the problem. Always no if `is_real_bug` is false.\n"
         "Credit substance, not wording; a cell number that is a little off is fine if "
-        "the code being pointed at is clearly the right code. The order the participant "
-        "ranked their findings in is not graded. Reports that are not in the answer key "
-        "earn nothing and cost nothing — mention in `notes`, briefly, any reported "
-        "issue that is wrong or is a valid extra bug, or leave `notes` empty. Each "
-        "`reasoning` is one concrete sentence."
+        "the code being pointed at is clearly the right code. Do not reward the "
+        "ranking. Judge each report on its own merits — do not penalise a valid bug "
+        "for being one you would not have listed. Each `reasoning` is one concrete "
+        "sentence covering both the bug and the fix. Use `notes` only for a brief "
+        "remark that does not fit the items, or leave it empty. If the write-up "
+        "reports no bugs, return no items."
     )
 
 
-def grade_debug_writeup(
-    client: Anthropic, buggy_notebook_text: str, answer_key: str, writeup_md: str
-) -> dict:
-    """Grade one participant's debug write-up against the answer key. Returns
+def grade_debug_writeup(client: Anthropic, buggy_notebook_text: str, writeup_md: str) -> dict:
+    """Grade one participant's debug write-up. Returns
     {"results": [{"section","criterion","max_pts","score","reasoning"}, ...],
-    "notes": str} — one result per key bug, scored 0-2 (clamped)."""
+    "notes": str} — one result per bug the participant reported, scored 0-2
+    (+1 real bug, +1 valid fix)."""
+    if not writeup_md.strip():
+        return {"results": [], "notes": "The write-up is empty."}
     graded = _parse(
         client,
-        # Notebook + key are identical for every participant, so cache them.
+        # The notebook is identical for every participant, so cache it.
         [{
             "type": "text",
-            "text": _grade_system(buggy_notebook_text, answer_key),
+            "text": _grade_system(buggy_notebook_text),
             "cache_control": {"type": "ephemeral"},
         }],
-        f"===== BEGIN WRITE-UP =====\n{writeup_md.strip() or '(empty)'}\n===== END WRITE-UP =====",
+        f"===== BEGIN WRITE-UP =====\n{writeup_md.strip()}\n===== END WRITE-UP =====",
         DebugGrade, max_tokens=8000, what="grade this write-up",
     )
-    if not graded.items:
-        raise RuntimeError("The model returned no graded items — try again.")
-    results = [
-        {
+    results = []
+    for g in graded.items:
+        real = bool(g.is_real_bug)
+        fix = real and bool(g.fix_is_valid)
+        results.append({
             "section": "Debugging",
             "criterion": g.bug.strip(),
             "max_pts": MAX_PTS_PER_BUG,
-            "score": max(0, min(int(g.score), MAX_PTS_PER_BUG)),
-            "reasoning": g.reasoning,
-        }
-        for g in graded.items
-    ]
+            "score": int(real) + int(fix),
+            "reasoning": f"Bug: {'✓' if real else '✗'} · Fix: {'✓' if fix else '✗'} — {g.reasoning.strip()}",
+        })
     return {"results": results, "notes": graded.notes.strip()}
