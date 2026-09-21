@@ -230,8 +230,10 @@ create table if not exists participant_turn_annotations (
   phase text,                    -- source='log' only: planning | implementing | debugging | verifying | reflecting
   delegation_posture text,       -- source='log' only: high_level_ask | step_by_step | clarifying_question
   trust_behavior text,           -- source='log' only: accepts_unreviewed | reviews_edits | rejects_redirects | insufficient_context
-  accuracy text,                 -- source='transcript' only: accurate | partially_accurate | inaccurate | unverifiable
-                                  -- (does the participant's spoken answer match what their notebook actually shows)
+  accuracy text,                 -- source='transcript' only: fully_correct (2) | partially_correct (1) | incorrect (0) | inapplicable (0)
+                                  -- (0-2 grade of the spoken answer, checked against their notebook where it relies on it;
+                                  -- inapplicable = notebook-dependent answer but the notebook is empty/missing.
+                                  -- Rows graded earlier hold the old labels accurate | partially_accurate | inaccurate | unverifiable.)
   reasoning text,                -- short model-written justification
   model text not null,
   created_at timestamptz not null default now(),
@@ -378,3 +380,26 @@ alter table participants add column if not exists stage text;
 -- no manual/AI split. No migration is needed or wanted: the column is free text,
 -- and participants collected under the old protocol keep their split documents,
 -- which Admin still displays.
+
+
+-- Autograde of a participant's debugging write-up or ideation pitch transcript
+-- (participant_files, doc_type 'debug' / 'ideate') -- see lib/debug_grading.py and
+-- lib/ideate_grading.py. One row per (participant, task). The grading material
+-- itself lives in task_instructions: the buggy notebook and its answer key
+-- ('debug_notebook' / 'debug_answer_key') and the ideation rubric
+-- ('ideate_rubric'), so it needs no table of its own.
+create table if not exists participant_task_grades (
+  subject_id text not null references participants (subject_id) on delete cascade,
+  task_key text not null,            -- 'debug' | 'ideate'
+  results jsonb not null,            -- [{"section","criterion","max_pts","score","reasoning"}, ...]
+  total_score numeric not null,
+  max_score numeric not null,
+  notes text,                        -- grader's remarks that don't fit a rubric item
+  grader_model text,
+  graded_at timestamptz not null default now(),
+  primary key (subject_id, task_key)
+);
+
+alter table participant_task_grades enable row level security;
+
+notify pgrst, 'reload schema';

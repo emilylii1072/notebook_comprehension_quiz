@@ -42,8 +42,7 @@ was already running.
 | 1 | `pre_survey` | The opening survey (`lib/surveys.py`). Every question is required. |
 | 2 | `main_task` | The main-task document **for their condition**, then a **40-minute** countdown. |
 | 2 | `main_upload` | `Pxxx_task_plan.md` + `Pxxx_notebook.ipynb` (exact names), plus any number of extra files under any name. |
-| 3 | `ideate_task` | The ideation document. **Untimed** — the clock counts up and the duration is recorded. |
-| 3 | `ideate_upload` | `Pxxx_ideate.md`. |
+| 3 | `ideate_task` | The ideation document. **Untimed** — the clock counts up and the duration is recorded. **Nothing is uploaded**: the participant pitches their idea aloud, and the researcher uploads the transcript in Admin → Participant → Ideate, where it is graded. |
 | 4 | `quiz` | The notebook-comprehension quiz (below). No score is shown. Status → `quiz_done`. |
 | 5 | `interview` | Hand-off screen: the participant answers questions verbally with the researcher. Nothing to upload. |
 | 6 | `debug_task` | The debugging document, then a **15-minute** countdown. |
@@ -68,8 +67,9 @@ always arrive keyed to the right participant.
 > **Earlier protocol.** Participants run before this flow have their reflection
 > documents split into manual and AI versions (`Pxxx_debug_manual.md`,
 > `Pxxx_debug_ai.md`, `Pxxx_ideate_manual.md`, `Pxxx_ideate_ai.md`). Nothing
-> writes those any more — new runs collect one `ideate` and one `debug` document
-> — but Admin still displays and can replace them.
+> writes those any more — new runs collect one `debug` document (and no ideation
+> upload: the researcher adds the pitch transcript as the `ideate` document) — but
+> Admin still displays and can replace them.
 
 ## Comprehension quiz
 
@@ -127,7 +127,8 @@ Password gate (`ADMIN_PASSWORD`). Seven tabs:
    files), the task plan / ideation / debugging documents, the graded notebook
    (per-item scores + reasoning + transcript), the quiz breakdown, the **verbal
    assessment** (upload a `.txt` transcript → Claude splits it into timestamped
-   question/answer pairs; not scored), the interactive session timeline with
+   question/answer pairs, then a Fact-check grades each answer 0–2 against the
+   participant's own notebook), the interactive session timeline with
    click-to-open event detail, and raw file downloads. A "Grade now" button for
    anything still ungraded.
 3. **Cohort stats** — outcome and behaviour metrics overall and split by condition
@@ -141,7 +142,12 @@ Password gate (`ADMIN_PASSWORD`). Seven tabs:
 5. **Task instructions** — upload the markdown each task screen shows: one
    main-task document per condition (slow planning / slow iterating / control)
    plus the shared ideation and debugging ones. **Upload all five before running
-   anyone** — a task with no document cannot be started.
+   anyone** — a task with no document cannot be started. Below them, the grading material (admin only):
+   the **debugging** buggy `.ipynb` plus its **answer key** (draft it with Opus 5, edit,
+   save), and the **ideation rubric**. A participant's Debug sub-tab then autogrades
+   their write-up 0–2 per key bug (`lib/debug_grading.py`), and their Ideate sub-tab
+   grades the pitch transcript against the rubric, read verbatim
+   (`lib/ideate_grading.py`); results go to `participant_task_grades`.
 6. **Notebook report** — the visual grading report across all graded notebooks.
 7. **Grading & rubric** — the active rubric, upload/replace a rubric CSV + task
    text, and "grade all pending participants".
@@ -161,6 +167,9 @@ Tables (`supabase_schema.sql`):
 - `participant_extra_files` — anything extra attached to the main task (binaries
   are base64'd, which `encoding` records)
 - `participant_notebooks` — the `.ipynb` transcript + its rubric grading
+- `participant_task_grades` — the autograde of a participant's debugging write-up
+  or ideation pitch transcript, one row per (participant, task). The grading material
+  is `task_instructions` rows: `debug_notebook`, `debug_answer_key`, `ideate_rubric`.
 - `participant_quiz` — the comprehension-quiz result + per-question breakdown
 - `participant_surveys` — the pre/post survey responses + per-item timing
 - `participant_task_timings` — when each timed task was started and finished

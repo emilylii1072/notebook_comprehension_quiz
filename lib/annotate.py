@@ -7,9 +7,11 @@ delegation-conditions study. Two sources, two different taxonomies:
     it ("transcript" format; "history" format has no context at all).
   - a verbal-assessment transcript's Q/A pairs (`lib.transcript.parse_transcript`
     output) — the participant answering interview questions about the notebook
-    task *after the fact*. There's no delegation happening here; what matters is
-    whether the spoken answer is *truthful to the participant's own notebook* —
-    one call per pair, checked against the notebook text (ground truth).
+    task *after the fact*. There's no delegation happening here; each answer is
+    graded 0-2 (incorrect / partially correct / fully correct and complete) — one
+    call per pair, checked against the participant's notebook text (ground truth)
+    wherever the answer relies on it. If the notebook is empty or missing, a
+    notebook-dependent answer is "inapplicable" (scores 0) rather than "incorrect".
 
 Tags are constrained enums (Pydantic `Literal`s), so `client.messages.parse`
 validates structure for us — no self-check/repair loop needed, unlike quiz.py's
@@ -21,6 +23,8 @@ from typing import Literal
 import anthropic
 from anthropic import Anthropic
 from pydantic import BaseModel, ValidationError
+
+from lib.notebook import notebook_has_content
 
 MODEL = "claude-opus-5"
 
@@ -129,22 +133,30 @@ def annotate_log(
 
 
 _TRANSCRIPT_SYSTEM = (
-    "You fact-check one answer from a verbal assessment given right after a "
-    "take-home data-science task. The interviewer asked the participant questions "
-    "about the task; you're given the participant's own notebook as ground truth. "
-    "Judge whether the spoken answer is truthful to what the notebook actually "
-    "shows — not whether the answer is a *good* approach, just whether it "
-    "accurately describes what the participant actually did.\n\n"
-    "Tag accuracy:\n"
-    "- accurate: the answer's factual claims match what the notebook shows.\n"
-    "- partially_accurate: some claims match; others are vague, overstated, or "
-    "slightly off from what the notebook actually contains.\n"
-    "- inaccurate: the answer contradicts or fabricates something the notebook "
-    "does not show (e.g. describing a method, metric, or step that isn't there).\n"
-    "- unverifiable: the question is conceptual/opinion-based (e.g. \"what would "
-    "you do differently\") and isn't a claim about the notebook's contents at all.\n\n"
-    "Write one short sentence of reasoning citing the specific notebook content "
-    "(or its absence) that the verdict rests on."
+    "You grade one answer from a verbal assessment given right after a "
+    "take-home data-science task (an MVP employee-attrition model). The interviewer "
+    "asked the participant questions about the task; you're given the participant's "
+    "own notebook as ground truth for what they actually did.\n\n"
+    "Grade every answer on a 2-point scale for whether it is correct and complete:\n"
+    "- fully_correct (2): correct and complete — it fully answers the question. Where "
+    "it describes the notebook (what was done, which columns/methods/metrics were "
+    "used), every such claim matches what the notebook shows. Where the question is "
+    "conceptual or opinion-based (e.g. \"what would you do differently\", \"what "
+    "should we keep in mind\"), it is sound, relevant and sufficiently complete.\n"
+    "- partially_correct (1): partly right or partly complete — some claims are "
+    "correct but others are vague, overstated, off from the notebook, or the answer "
+    "leaves out an important part of what was asked.\n"
+    "- incorrect (0): wrong, contradicts or fabricates something (e.g. a method, "
+    "metric or step the notebook doesn't show), doesn't address the question, or "
+    "was not given.\n"
+    "- inapplicable (0): the answer can only be judged against the notebook, and "
+    "the notebook is empty or missing, so there is nothing to judge it against. "
+    "Use this only for notebook-dependent answers; a conceptual question is still "
+    "graded fully_correct / partially_correct / incorrect on its own merits even "
+    "when the notebook is empty.\n\n"
+    "Grade the answer as given, not how good the participant's approach was. Write "
+    "one short sentence of reasoning citing the specific notebook content (or its "
+    "absence) or the specific gap that the grade rests on."
 )
 
 _TRANSCRIPT_INSTRUCTIONS = """\
@@ -156,17 +168,29 @@ THEIR NOTEBOOK (ground truth):
 %s
 """
 
+# accuracy label -> points. inapplicable scores 0, but stays its own label so
+# "couldn't be judged" isn't confused with "judged wrong".
+TRANSCRIPT_SCORES = {"fully_correct": 2, "partially_correct": 1, "incorrect": 0, "inapplicable": 0}
+
+_NO_NOTEBOOK = "(no notebook on file — nothing to judge notebook-dependent answers against)"
+_EMPTY_NOTEBOOK = "(the notebook is EMPTY — every cell is blank, so nothing to judge notebook-dependent answers against)"
+
 
 class TranscriptAnswerAnnotation(BaseModel):
-    accuracy: Literal["accurate", "partially_accurate", "inaccurate", "unverifiable"]
+    accuracy: Literal["fully_correct", "partially_correct", "incorrect", "inapplicable"]
     reasoning: str
 
 
 def annotate_transcript_answer(
     client: Anthropic, question: str, answer: str, notebook_text: str
 ) -> TranscriptAnswerAnnotation:
-    """One LLM call, checking one verbal-assessment answer against the
-    participant's own notebook. Same error contract as annotate_turn."""
+    """One LLM call, grading one verbal-assessment answer 0-2 (against the
+    participant's own notebook where it relies on it). Same error contract as
+    annotate_turn."""
+    if not notebook_text:
+        notebook_text = _NO_NOTEBOOK
+    elif not notebook_has_content(notebook_text):
+        notebook_text = _EMPTY_NOTEBOOK
     try:
         response = client.messages.parse(
             model=MODEL,
@@ -176,8 +200,7 @@ def annotate_transcript_answer(
             messages=[{
                 "role": "user",
                 "content": _TRANSCRIPT_INSTRUCTIONS % (
-                    question or "(empty)", answer or "(no answer given)",
-                    notebook_text or "(no notebook on file)",
+                    question or "(empty)", answer or "(no answer given)", notebook_text,
                 ),
             }],
             output_format=TranscriptAnswerAnnotation,

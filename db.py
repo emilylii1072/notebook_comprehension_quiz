@@ -496,6 +496,52 @@ def update_participant_grading(
         return False, str(e)
 
 
+def save_task_grade(
+    subject_id: str, task_key: str, results: list[dict], total_score: float,
+    max_score: float, notes: str, grader_model: str,
+) -> tuple[bool, str | None]:
+    """Upsert the autograde of one task's admin-graded material -- the debugging
+    write-up ('debug') or the ideation pitch transcript ('ideate'). One per
+    (participant, task); re-grading replaces it."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database not configured."
+    try:
+        client.table("participant_task_grades").upsert(
+            {
+                "subject_id": subject_id,
+                "task_key": task_key,
+                "results": results,
+                "total_score": total_score,
+                "max_score": max_score,
+                "notes": notes or None,
+                "grader_model": grader_model,
+                "graded_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="subject_id,task_key",
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def get_task_grade(subject_id: str, task_key: str) -> dict | None:
+    """The stored autograde for one task, or None -- also when the
+    participant_task_grades table doesn't exist yet."""
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        rows = (
+            client.table("participant_task_grades").select("*")
+            .eq("subject_id", subject_id).eq("task_key", task_key)
+            .limit(1).execute().data or []
+        )
+    except Exception:
+        return None
+    return rows[0] if rows else None
+
+
 def set_participant_grading_error(subject_id: str, message: str) -> None:
     client = get_supabase_client()
     if client is None:

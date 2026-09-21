@@ -118,20 +118,13 @@ class GradeResult(BaseModel):
     items: list[GradedItem]
 
 
-def grade_notebook(
-    client: Anthropic, task: str, rubric_csv: str, notebook_text: str,
-    instructions: str | None = None,
+def grade_with_prompt(
+    client: Anthropic, system_text: str, user_content: str, what: str
 ) -> list[dict]:
-    """Score one notebook against the rubric CSV. The CSV text is given to the model
-    exactly as uploaded; the model reads it and returns one score + reasoning per
-    rubric item. `instructions` overrides the default "how to grade" rules (see
-    build_system_prompt) when the rubric has its own. Returns
-    [{"section","criterion","max_pts","score","reasoning"}]."""
-    user_content = (
-        "Grade the following notebook.\n\n"
-        f"===== BEGIN NOTEBOOK TRANSCRIPT =====\n{notebook_text}\n"
-        "===== END NOTEBOOK TRANSCRIPT ====="
-    )
+    """One structured grading call: `system_text` carries the rubric, `user_content`
+    the thing being graded. Returns [{"section","criterion","max_pts","score",
+    "reasoning"}] with each score clamped into [0, max_pts]. Raises RuntimeError with
+    a user-facing message on a malformed / refused / truncated response."""
     try:
         response = client.messages.parse(
             model=MODEL,
@@ -141,7 +134,7 @@ def grade_notebook(
             timeout=600.0,
             system=[{
                 "type": "text",
-                "text": build_system_prompt(task, rubric_csv, instructions),
+                "text": system_text,
                 "cache_control": {"type": "ephemeral"},
             }],
             messages=[{"role": "user", "content": user_content}],
@@ -153,7 +146,7 @@ def grade_notebook(
         ) from e
     if response.stop_reason == "refusal":
         detail = getattr(response.stop_details, "explanation", None) or "safety refusal"
-        raise RuntimeError(f"The model declined to grade this notebook ({detail}).")
+        raise RuntimeError(f"The model declined to grade this {what} ({detail}).")
     if response.stop_reason == "max_tokens":
         raise RuntimeError("The model ran out of room before finishing — try again.")
     parsed = response.parsed_output
@@ -174,6 +167,25 @@ def grade_notebook(
             }
         )
     return results
+
+
+def grade_notebook(
+    client: Anthropic, task: str, rubric_csv: str, notebook_text: str,
+    instructions: str | None = None,
+) -> list[dict]:
+    """Score one notebook against the rubric CSV. The CSV text is given to the model
+    exactly as uploaded; the model reads it and returns one score + reasoning per
+    rubric item. `instructions` overrides the default "how to grade" rules (see
+    build_system_prompt) when the rubric has its own. Returns
+    [{"section","criterion","max_pts","score","reasoning"}]."""
+    user_content = (
+        "Grade the following notebook.\n\n"
+        f"===== BEGIN NOTEBOOK TRANSCRIPT =====\n{notebook_text}\n"
+        "===== END NOTEBOOK TRANSCRIPT ====="
+    )
+    return grade_with_prompt(
+        client, build_system_prompt(task, rubric_csv, instructions), user_content, "notebook"
+    )
 
 
 def call_with_errors_surfaced(fn, *args, **kwargs):

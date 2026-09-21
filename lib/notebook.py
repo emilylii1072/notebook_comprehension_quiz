@@ -4,9 +4,20 @@ Shared by the quiz (question generation) and the grader (rubric scoring), which
 previously each carried their own identical copy of this function.
 """
 
+import re
+
 import nbformat
 
 MAX_OUTPUT_CHARS_PER_CELL = 1500
+
+_CELL_HEADER = re.compile(r"^--- (?:markdown|code) cell \d+ ---$|^--- output of cell \d+ ---$", re.M)
+
+
+def notebook_has_content(notebook_text: str | None) -> bool:
+    """True if the flattened notebook holds anything beyond the `--- code cell N ---`
+    headers. A notebook of blank cells still flattens to a non-empty string, so a
+    plain `.strip()` check lets it through."""
+    return bool(notebook_text and _CELL_HEADER.sub("", notebook_text).strip())
 
 
 def notebook_to_text(raw: bytes) -> str:

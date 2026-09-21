@@ -59,6 +59,10 @@ FIXED_MODEL_OPTIONS = ["Random Forest", "XGBoost", "Logistic Regression", "Suppo
 # Slots whose option SET is fixed (only correct_index may move during a repair).
 FIXED_OPTION_SLOTS = {"model_choice", "io_overlap"}
 
+# The model_choice question is asked in these exact words, whatever the notebook.
+# assemble_static_questions re-applies it after the self-check, which may reword.
+MODEL_CHOICE_QUESTION = "What model did you use for predicting attrition?"
+
 # Hardcoded distractor pools. For these slots the distractors are taken VERBATIM
 # from the pool (three that the notebook did NOT do); the correct option is a pool
 # entry when one fits and otherwise a model-written sentence held to the pool's
@@ -146,7 +150,8 @@ distractors (ones the notebook did NOT do), and for the correct option use the P
 entry that matches the notebook verbatim -- or, only if none fits, one sentence of \
 your own at the same length and detail as the POOL entries.""",
     "model_choice": """\
-3. model_choice — Determine which ONE of these four algorithms the notebook \
+3. model_choice — Ask exactly: "What model did you use for predicting attrition?" \
+Determine which ONE of these four algorithms the notebook \
 actually used/chose as its (primary or recommended) attrition model: "Random \
 Forest", "XGBoost", "Logistic Regression", "Support Vector Machine". Set "options" \
 to these four exact strings (verbatim, any order) and "correct_index" to whichever \
@@ -763,6 +768,7 @@ def assemble_static_questions(client: Anthropic, notebook_text: str) -> list[Qui
     st.session_state.generation_warnings = warnings
 
     by_slot = {q.slot: q for q in generated}
+    by_slot["model_choice"].question = MODEL_CHOICE_QUESTION
     return [
         num_employees_question(),
         row_granularity_question(),

@@ -9,9 +9,11 @@ checkpoint:
     pre_survey      lib/surveys.py PRE_SURVEY_ITEMS
     main_task       the condition's task document, then a 40-minute countdown
     main_upload     plan + notebook (exact names) + any extra files
-    ideate_task     the ideation document, untimed but measured
-    ideate_upload   one ideation markdown document
-    quiz            the notebook comprehension MCQ
+    ideate_task     the ideation document, untimed but measured. Nothing is
+                    uploaded: the participant pitches their idea aloud and the
+                    admin uploads the transcript afterwards (Admin > Participant
+                    > Ideate), where it is graded.
+    quiz           the notebook comprehension MCQ
     interview       hand-off screen; the interview happens away from the app
     debug_task      the debugging document, then a 15-minute countdown
     debug_upload    one debugging markdown document
@@ -88,17 +90,20 @@ CONDITION_LABEL = {
 # from in_progress to quiz_done at the MCQ and to complete at the end, matching
 # what those values have always meant.
 STAGES = [
-    "pre_survey", "main_task", "main_upload", "ideate_task", "ideate_upload",
+    "pre_survey", "main_task", "main_upload", "ideate_task",
     "quiz", "interview", "debug_task", "debug_upload", "log_upload",
     "post_survey", "complete",
 ]
 STAGE_STATUS = {"complete": "complete"}
+# Stages that no longer exist, for participants whose stored `stage` predates the
+# change. The ideation upload screen is gone, so they carry on from the quiz.
+RETIRED_STAGES = {"ideate_upload": "quiz"}
 
 # Progress labels — the participant sees how far along they are, never a score.
 STAGE_STEP = {
     "pre_survey": ("Opening survey", 1),
     "main_task": ("Main task", 2), "main_upload": ("Main task", 2),
-    "ideate_task": ("Idea generation", 3), "ideate_upload": ("Idea generation", 3),
+    "ideate_task": ("Idea generation", 3),
     "quiz": ("Questions about your notebook", 4),
     "interview": ("Interview", 5),
     "debug_task": ("Debugging", 6), "debug_upload": ("Debugging", 6),
@@ -107,18 +112,17 @@ STAGE_STEP = {
 }
 N_STEPS = 8
 
-# doc_type -> filename suffix. One document per task now: the manual/AI split
-# (debug_manual / debug_ai / ideate_manual / ideate_ai) belonged to an earlier
-# protocol and is no longer collected, though Admin still shows it for
-# participants who were run under it.
+# doc_type -> filename suffix, for the documents a participant uploads. The
+# manual/AI split (debug_manual / debug_ai / ideate_manual / ideate_ai) belonged to
+# an earlier protocol and is no longer collected, and neither is an ideation
+# write-up (the pitch is transcribed by the admin), though Admin still shows them
+# for participants who were run under those protocols.
 DOC_SUFFIXES = {
     "task_plan": "task_plan.md",
-    "ideate": "ideate.md",
     "debug": "debug.md",
 }
 DOC_TITLES = {
     "task_plan": "Task plan",
-    "ideate": "Idea generation write-up",
     "debug": "Debugging write-up",
 }
 
@@ -341,6 +345,7 @@ if _stage == "identify":
     # --- partway through: resume exactly where they stopped ---
     elif id_ok and existing is not None:
         resume = existing.get("stage")
+        resume = RETIRED_STAGES.get(resume, resume)
         if resume not in STAGES:
             # Started before per-stage resume existed, or never got past the
             # opening survey: fall back to the survey, skipping it if it's done.
@@ -438,12 +443,7 @@ elif _stage == "main_upload":
 
 # ---- Stage: ideation task ------------------------------------------------
 elif _stage == "ideate_task":
-    render_task_screen(task_key=tasks.IDEATE, next_stage="ideate_upload")
-
-elif _stage == "ideate_upload":
-    render_single_doc_upload(
-        doc_type="ideate", task_key=tasks.IDEATE, next_stage="quiz",
-    )
+    render_task_screen(task_key=tasks.IDEATE, next_stage="quiz")
 
 # ---- Stage: MCQ about their own notebook ---------------------------------
 elif _stage == "quiz":
