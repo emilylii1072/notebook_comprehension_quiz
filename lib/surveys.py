@@ -168,21 +168,6 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
         options=["Plan myself + AI implements", "AI implements + I evaluate", "Other"],
         free_text_options=("Other",),
     ),
-    SurveyItem(
-        id="ai_collab_learn_strategies", kind="matrix", category="AI collab",
-        question="How likely are you to use the following strategies to learn something new?",
-        rows=[
-            "Let AI summarize/break down the topic for me",
-            "Ask AI questions for AI to answer",
-            "Iterate your thoughts/answers with AI and ask AI to critique",
-            "Let AI ask you questions and critique your answer",
-        ],
-        options=[
-            "Extremely unlikely", "Unlikely", "Slightly Unlikely", "Neutral",
-            "Slightly likely", "Likely", "Extremely likely",
-        ],
-        optional=True,
-    ),
     SurveyItem(id="pre_knowledge_notice", kind="notice", question=_KNOWLEDGE_NOTICE),
     SurveyItem(
         id="know_ds1", kind="single_select", category="Data science",
@@ -537,10 +522,7 @@ MATCHED_LIKERT: list[tuple[str, str, str, str, str]] = [
 # Likert scales, most-negative first, for ordering a stacked distribution. A
 # matrix item's own `options` may be reversed (the post-survey shows some scales
 # strongly-agree-first); charts order by these, not by presentation order.
-LIKERT_SCALES: list[list[str]] = [_AGREE_5, _FREQ_5, _EXTENT_5, [
-    "Extremely unlikely", "Unlikely", "Slightly Unlikely", "Neutral",
-    "Slightly likely", "Likely", "Extremely likely",
-]]
+LIKERT_SCALES: list[list[str]] = [_AGREE_5, _FREQ_5, _EXTENT_5]
 
 ITEMS_BY_ID: dict[str, SurveyItem] = {
     it.id: it for it in (*PRE_SURVEY_ITEMS, *POST_SURVEY_ITEMS)
