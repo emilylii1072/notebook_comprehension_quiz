@@ -433,20 +433,20 @@ def delete_participant_file(subject_id: str, doc_type: str) -> tuple[bool, str |
 
 
 def save_participant_notebook(
-    subject_id: str, filename: str, notebook_text: str
+    subject_id: str, filename: str, notebook_text: str, notebook_html: str | None = None
 ) -> tuple[bool, str | None]:
     client = get_supabase_client()
     if client is None:
         return False, "Database not configured."
+    row = {
+        "subject_id": subject_id,
+        "filename": filename,
+        "notebook_text": notebook_text,
+    }
+    if notebook_html is not None:
+        row["notebook_html"] = notebook_html
     try:
-        client.table("participant_notebooks").upsert(
-            {
-                "subject_id": subject_id,
-                "filename": filename,
-                "notebook_text": notebook_text,
-            },
-            on_conflict="subject_id",
-        ).execute()
+        client.table("participant_notebooks").upsert(row, on_conflict="subject_id").execute()
         return True, None
     except Exception as e:
         return False, str(e)

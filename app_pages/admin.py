@@ -2,14 +2,16 @@
 
 Password-gated (set ADMIN_PASSWORD in secrets / .env). Seven top-level tabs:
   1. Overview        — one row per participant, filter by condition, CSV export
-  2. Participant     — sub-tabs per task/data type: Surveys, Task timing, Task
-                       plan, Ideate, Debug, Notebook grade, Quiz, Verbal
-                       assessment, Session timeline, Raw files.
+  2. Participant     — sub-tabs per task/data type, in this order: Surveys,
+                       Task timing, Task plan, Task notebook, Ideate, Quiz,
+                       Verbal assessment, Debug, Session timeline, Raw files.
                        Debug and Ideate each have an Autograde block. Debug: the
-                       write-up is read against the buggy notebook the admin uploads
-                       under Task instructions; each bug the participant reported
-                       scores +1 if it is a real bug and +1 if the fix is valid.
-                       Ideate: participants upload nothing; the
+                       buggy notebook is shown (rendered HTML, lib.notebook)
+                       above the write-up, and each graded bug is shown next to
+                       the notebook cell it's about (+1 if it's a real bug, +1
+                       if the fix is valid) -- lib/debug_grading.py has the
+                       grader identify that cell alongside the score. Ideate:
+                       participants upload nothing; the
                        admin uploads a transcript of their spoken pitch, scored
                        against an admin-uploaded rubric (Task instructions).
                        Task timing shows how long each timed task actually took
@@ -48,6 +50,7 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Seven top-level tabs:
 One page of the multipage app — run via `streamlit run app.py`.
 """
 
+import base64
 import io
 
 import pandas as pd
@@ -276,6 +279,25 @@ def _grade_task_for(subject_id: str, task_key: str, text: str) -> tuple[bool, st
     return (ok, f"graded: {total:g} / {mx:g}" if ok else (err or "save failed"))
 
 
+def _render_notebook_html(html: str | None, *, key: str, height: int = 650) -> None:
+    """A rendered notebook (lib.notebook.notebook_to_html): an "open in a new
+    tab" link (data: URI, no server route needed) plus an inline, collapsed
+    preview so admin doesn't have to leave the page to check it. Renders a
+    caption instead when there's no HTML saved for this notebook yet (older
+    participants, or one uploaded before this feature existed)."""
+    if not html:
+        st.caption("No rendered HTML for this notebook yet — re-upload it to generate one.")
+        return
+    b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+    st.markdown(
+        f'📓 <a href="data:text/html;base64,{b64}" target="_blank" rel="noopener">'
+        "<strong>Open the notebook in a new tab</strong></a>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("View inline", key=f"nb_inline_{key}"):
+        components.html(html, height=height, scrolling=True)
+
+
 def _render_graded_rubric(results: list[dict], sid: str, name: str) -> None:
     """A filled-in rubric as readable rows — score, criterion, and the grader's full
     reasoning, grouped by section — rather than a table that clips long cells, plus
@@ -298,6 +320,35 @@ def _render_graded_rubric(results: list[dict], sid: str, name: str) -> None:
     st.download_button(
         "⬇️ Download graded rubric (CSV)", data=csv.to_csv(index=False).encode("utf-8"),
         file_name=f"{sid}_{name}_graded.csv", mime="text/csv", key=f"dl_graded_{name}_{sid}",
+    )
+
+
+def _render_debug_bugs(results: list[dict], sid: str) -> None:
+    """The debugging task's graded bugs, aligned with the notebook cell each one
+    is about -- grouped by cell number (ascending; bugs the grader couldn't tie
+    to one specific cell come last), so a cell's "Cell N" label in the notebook
+    view above lines up with its bugs here. Same score/criterion/reasoning row
+    layout as _render_graded_rubric, plus the cell number and a CSV download."""
+    def _sort_key(r: dict):
+        cell = r.get("cell")
+        return (1, 0) if cell is None else (0, cell)
+
+    for r in sorted(results, key=_sort_key):
+        cell = r.get("cell")
+        c_cell, c_score, c_text = st.columns([1, 1, 6])
+        c_cell.markdown(f"**Cell {cell}**" if cell is not None else "_cell unclear_")
+        c_score.markdown(f"**{float(r.get('score') or 0):g} / {float(r.get('max_pts') or 0):g}**")
+        c_text.markdown(f"**{r.get('criterion') or ''}**")
+        if r.get("reasoning"):
+            c_text.markdown(r["reasoning"])
+    csv = pd.DataFrame(results)
+    for col in ("section", "criterion", "score", "max_pts", "reasoning", "cell"):
+        if col not in csv.columns:
+            csv[col] = None
+    st.download_button(
+        "⬇️ Download graded bugs (CSV)",
+        data=csv[["cell", "criterion", "score", "max_pts", "reasoning"]].to_csv(index=False).encode("utf-8"),
+        file_name=f"{sid}_debug_graded.csv", mime="text/csv", key=f"dl_graded_debug_{sid}",
     )
 
 
@@ -325,7 +376,10 @@ def _render_task_grade(sid: str, task_key: str, doc: dict | None) -> None:
     if grade:
         st.metric("Total", f"{grade['total_score']:g} / {grade['max_score']:g}")
         if grade["results"]:
-            _render_graded_rubric(grade["results"], sid, task_key)
+            if task_key == tasks.DEBUG:
+                _render_debug_bugs(grade["results"], sid)
+            else:
+                _render_graded_rubric(grade["results"], sid, task_key)
         else:
             st.caption("No bugs were reported in this write-up.")
         if grade.get("notes"):
@@ -436,15 +490,22 @@ def _notebook_upload_widget(sid: str, exists: bool) -> None:
     Re-grade is clicked."""
     up = st.file_uploader("Replace notebook (.ipynb)", type=["ipynb"], key="up_notebook")
     if up is not None and st.button("Save notebook", key="save_notebook"):
+        nb_bytes = up.getvalue()
         try:
-            notebook_text = notebook_to_text(up.getvalue())
+            notebook_text = notebook_to_text(nb_bytes)
         except Exception as e:
             st.error(f"Could not read notebook: {e}")
             return
         if not notebook_text.strip():
             st.error("Notebook appears to be empty.")
             return
-        ok, err = save_participant_notebook(sid, f"{sid}_notebook.ipynb", notebook_text)
+        try:
+            notebook_html = notebook_to_html(nb_bytes)
+        except Exception:
+            notebook_html = None
+        ok, err = save_participant_notebook(
+            sid, f"{sid}_notebook.ipynb", notebook_text, notebook_html
+        )
         if ok:
             delete_turn_annotations(sid, "transcript")
             st.success(
@@ -532,11 +593,11 @@ with tab_detail:
         logs = bundle["logs"]
 
         (
-            sub_surveys, sub_timings, sub_taskplan, sub_ideate, sub_debug,
-            sub_notebook, sub_quiz, sub_verbal, sub_timeline, sub_files,
+            sub_surveys, sub_timings, sub_taskplan, sub_notebook, sub_ideate,
+            sub_quiz, sub_verbal, sub_debug, sub_timeline, sub_files,
         ) = st.tabs([
-            "Surveys", "Task timing", "Task plan", "Ideate", "Debug",
-            "Notebook grade", "Quiz", "Verbal assessment", "Session timeline", "Raw files",
+            "Surveys", "Task timing", "Task plan", "Task notebook", "Ideate",
+            "Quiz", "Verbal assessment", "Debug", "Session timeline", "Raw files",
         ])
 
         with sub_surveys:
@@ -558,6 +619,13 @@ with tab_detail:
         ):
             with sub:
                 is_pitch = key == tasks.IDEATE
+                if key == tasks.DEBUG:
+                    st.markdown("##### Buggy notebook")
+                    _render_notebook_html(
+                        (get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY) or {}).get("notebook_html"),
+                        key=f"buggy_nb_{sid}",
+                    )
+                    st.markdown("##### Participant's write-up")
                 if key in docs:
                     # A transcript is line-per-segment plain text; keep its breaks.
                     body = docs[key]["content"]
@@ -637,7 +705,15 @@ with tab_detail:
                         st.rerun()
 
         with sub_notebook:
+            if nb:
+                st.markdown("##### Notebook")
+                _render_notebook_html(nb.get("notebook_html"), key=f"task_nb_{sid}")
+                if nb.get("notebook_text"):
+                    with st.expander("Flattened transcript (raw text, as graded)"):
+                        st.code(nb["notebook_text"])
             if nb and nb.get("results"):
+                st.divider()
+                st.markdown("##### Grade")
                 st.metric(
                     "Total",
                     f"{nb.get('total_score')} / {nb.get('max_score')}"
@@ -648,9 +724,6 @@ with tab_detail:
                 cohort.render_participant_notebook_sections(nb["results"], _section_rows, sid)
                 st.markdown("#### Graded rubric")
                 _render_graded_rubric(nb["results"], sid, "notebook")
-                if nb.get("notebook_text"):
-                    with st.expander("Notebook transcript (as graded)"):
-                        st.code(nb["notebook_text"])
                 c_pick, c_go = st.columns([3, 1])
                 pick = c_pick.selectbox(
                     "Re-grade against", _rubric_options,
@@ -662,6 +735,7 @@ with tab_detail:
                     (st.success if ok else st.error)(msg)
                     st.rerun()
             elif nb:
+                st.divider()
                 st.caption("Notebook stored but not graded yet.")
                 pick = st.selectbox(
                     "Grade against", _rubric_options,
@@ -672,9 +746,6 @@ with tab_detail:
                         ok, msg = _grade_one(sid, nb["notebook_text"], pick)
                     (st.success if ok else st.error)(msg)
                     st.rerun()
-                if nb.get("notebook_text"):
-                    with st.expander("Notebook transcript (ungraded)"):
-                        st.code(nb["notebook_text"])
             else:
                 st.caption("No notebook on file.")
             with st.expander("Upload / replace notebook"):

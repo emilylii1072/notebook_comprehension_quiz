@@ -24,6 +24,7 @@ MAX_PTS_PER_BUG = 2
 
 class BugGrade(BaseModel):
     bug: str              # short title of the bug as the participant reported it
+    cell: int | None       # which notebook cell it refers to (0-based, "Cell N"), or null
     is_real_bug: bool     # +1
     fix_is_valid: bool    # +1
     reasoning: str
@@ -80,7 +81,12 @@ def _grade_system(buggy_notebook_text: str) -> str:
         "the order they wrote them, one item per bug (if two entries describe the "
         "same underlying bug, count it once; if one entry bundles several separate "
         "bugs, split it). Copy or condense the participant's own title for the bug "
-        "into `bug`. Then score each item on two independent yes/no points:\n"
+        "into `bug`. Set `cell` to the N of the single cell (`--- ... cell N ---`) "
+        "the bug most centrally concerns — the write-up's own stated location if it "
+        "gives one and it checks out, otherwise the cell you'd point to yourself; "
+        "null only if no single cell is clearly the right one (the bug spans "
+        "several cells, or nothing in the notebook matches). Then score each item "
+        "on two independent yes/no points:\n"
         "- `is_real_bug` (+1): the reported issue is a genuine bug in the notebook — "
         "a flaw you can point to in the code that makes its results misleading or "
         "invalid (data leakage, how the target/label is built, how the data is split, "
@@ -101,9 +107,12 @@ def _grade_system(buggy_notebook_text: str) -> str:
 
 def grade_debug_writeup(client: Anthropic, buggy_notebook_text: str, writeup_md: str) -> dict:
     """Grade one participant's debug write-up. Returns
-    {"results": [{"section","criterion","max_pts","score","reasoning"}, ...],
+    {"results": [{"section","criterion","max_pts","score","reasoning","cell"}, ...],
     "notes": str} — one result per bug the participant reported, scored 0-2
-    (+1 real bug, +1 valid fix)."""
+    (+1 real bug, +1 valid fix). `cell` is the 0-based notebook cell (matching
+    notebook_to_html's "Cell N" labels) the bug refers to, or None if the model
+    couldn't tie it to one specific cell -- Admin's Debug sub-tab uses it to show
+    each bug alongside the cell it's about."""
     if not writeup_md.strip():
         return {"results": [], "notes": "The write-up is empty."}
     graded = _parse(
@@ -127,5 +136,6 @@ def grade_debug_writeup(client: Anthropic, buggy_notebook_text: str, writeup_md:
             "max_pts": MAX_PTS_PER_BUG,
             "score": int(real) + int(fix),
             "reasoning": f"Bug: {'✓' if real else '✗'} · Fix: {'✓' if fix else '✗'} — {g.reasoning.strip()}",
+            "cell": g.cell,
         })
     return {"results": results, "notes": graded.notes.strip()}

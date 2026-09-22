@@ -409,4 +409,18 @@ alter table participant_task_grades enable row level security;
 -- a written description of it.
 alter table task_instructions add column if not exists notebook_html text;
 
+-- Rendered HTML of a participant's own submitted main-task notebook
+-- (lib.notebook.notebook_to_html), set alongside notebook_text (the flattened
+-- text used for rubric grading) when the participant uploads it, or when the
+-- admin uploads/replaces it on their behalf. Admin's "Task notebook" sub-tab
+-- shows this instead of the raw flattened transcript.
+alter table participant_notebooks add column if not exists notebook_html text;
+
+-- Which buggy-notebook cell (0-based, matching the "Cell N" labels
+-- notebook_to_html inserts) a graded debugging bug refers to, folded into
+-- participant_task_grades.results' per-bug objects by lib/debug_grading.py --
+-- no column of its own, since results is already jsonb. Existing rows graded
+-- before this simply have no "cell" key in each item; admin's Debug sub-tab
+-- treats that the same as an unidentified cell.
+
 notify pgrst, 'reload schema';

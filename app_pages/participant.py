@@ -59,7 +59,7 @@ from db import (
 )
 from lib import grading, tasks
 from lib.llm import get_client
-from lib.notebook import notebook_to_text
+from lib.notebook import notebook_to_html, notebook_to_text
 from lib.quiz_ui import render_quiz_flow
 from lib.surveys import POST_SURVEY_ITEMS, PRE_SURVEY_ITEMS
 from lib.survey_ui import render_survey_flow
@@ -413,18 +413,26 @@ elif _stage == "main_upload":
         st.info("Submit unlocks once both required files are selected.")
 
     if st.button("Submit and continue", type="primary", disabled=not ready):
+        nb_bytes = by_name[nb_name].getvalue()
         try:
-            notebook_text = notebook_to_text(by_name[nb_name].getvalue())
+            notebook_text = notebook_to_text(nb_bytes)
         except Exception as e:
             st.error(f"Could not read {nb_name}: {e}")
             st.stop()
         if not notebook_text.strip():
             st.error(f"{nb_name} appears to be empty.")
             st.stop()
+        try:
+            notebook_html = notebook_to_html(nb_bytes)
+        except Exception:
+            # Grading only needs notebook_text -- don't block submission over an
+            # HTML rendering failure; Admin's Task notebook sub-tab falls back to
+            # the flattened transcript when notebook_html is missing.
+            notebook_html = None
 
         errors: list[str] = []
         with st.spinner("Saving your files…"):
-            ok, err = save_participant_notebook(sid, nb_name, notebook_text)
+            ok, err = save_participant_notebook(sid, nb_name, notebook_text, notebook_html)
             if not ok:
                 errors.append(f"{nb_name}: {err}")
             ok, err = save_participant_file(

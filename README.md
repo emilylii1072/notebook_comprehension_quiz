@@ -174,10 +174,13 @@ Tables (`supabase_schema.sql`):
 - `participant_files` — the per-task markdown docs (one row per `doc_type`)
 - `participant_extra_files` — anything extra attached to the main task (binaries
   are base64'd, which `encoding` records)
-- `participant_notebooks` — the `.ipynb` transcript + its rubric grading
+- `participant_notebooks` — the `.ipynb` flattened transcript + rendered HTML
+  (`notebook_html`, shown in Admin's Task notebook sub-tab) + its rubric grading
 - `participant_task_grades` — the autograde of a participant's debugging write-up
   or ideation pitch transcript, one row per (participant, task). The grading material
-  is `task_instructions` rows: `debug_notebook`, `ideate_rubric`.
+  is `task_instructions` rows: `debug_notebook`, `ideate_rubric`. Each graded
+  debugging bug also carries which buggy-notebook cell it's about (`cell`, inside
+  `results`), so Admin's Debug sub-tab can show it next to that cell.
 - `participant_quiz` — the comprehension-quiz result + per-question breakdown
 - `participant_surveys` — the pre/post survey responses + per-item timing
 - `participant_task_timings` — when each timed task was started and finished
