@@ -973,20 +973,32 @@ with tab_tasks:
             else:
                 st.caption(f"`{_key}` · nothing uploaded yet")
 
+            # The editor's text lives in session state so "Load into editor" can
+            # fill it in for review; a rerun applies that before the widget is
+            # created -- a text_area's `value=` kwarg is otherwise ignored once its
+            # key already exists in session state, so a plain `value=_seed` here
+            # would silently keep showing whatever was already in the box (blank,
+            # for a document with nothing saved yet) instead of the uploaded file.
+            _body_key = f"ti_body_{_key}"
+            _draft = st.session_state.pop(f"_ti_draft_{_key}", None)
+            if _draft is not None:
+                st.session_state[_body_key] = _draft
+            elif _body_key not in st.session_state:
+                st.session_state[_body_key] = _row.get("content") if _row else ""
+
             _up = st.file_uploader(
                 "Upload a .md file", type=["md"], key=f"ti_up_{_key}"
             )
-            _seed = _decode_upload(_up) if _up is not None else (
-                _row.get("content") if _row else ""
-            )
+            if _up is not None and st.button("Load into editor", key=f"ti_load_{_key}"):
+                st.session_state[f"_ti_draft_{_key}"] = _decode_upload(_up)
+                st.rerun()
             _heading = st.text_input(
                 "Heading shown above the instructions (optional)",
                 value=(_row.get("title") or "") if _row else "",
                 key=f"ti_title_{_key}",
             )
             _body = st.text_area(
-                "Instructions (markdown)", value=_seed or "", height=280,
-                key=f"ti_body_{_key}",
+                "Instructions (markdown)", height=280, key=_body_key,
             )
             if _body.strip():
                 with st.expander("Preview as the participant sees it"):
@@ -1004,6 +1016,8 @@ with tab_tasks:
                 st.rerun()
             if _row and c_del.button("🗑️ Delete", key=f"ti_del_{_key}"):
                 ok, err = delete_task_instruction(_key)
+                if ok:
+                    st.session_state.pop(_body_key, None)
                 st.session_state["_task_save_msg"] = (
                     ok, f"Deleted {_title}." if ok else f"Not deleted: {err}"
                 )
