@@ -24,7 +24,7 @@ MAX_PTS_PER_BUG = 2
 
 class BugGrade(BaseModel):
     bug: str              # short title of the bug as the participant reported it
-    cell: int | None       # which notebook cell it refers to (0-based, "Cell N"), or null
+    cell: str | None       # the notebook's own cell label (e.g. "C4") it refers to, or null
     is_real_bug: bool     # +1
     fix_is_valid: bool    # +1
     reasoning: str
@@ -74,18 +74,22 @@ def _grade_system(buggy_notebook_text: str) -> str:
         "You are an expert data scientist grading one participant's debugging "
         "write-up, strictly and consistently.\n\n" + _TASK_CONTEXT + "\n\n"
         "## The notebook they were given\n"
-        "Cell numbers refer to the `--- ... cell N ---` markers.\n"
+        "The `--- ... cell N ---` markers below are just a transcript boundary. "
+        "The notebook's own cells are separately labeled in their actual content "
+        "(e.g. \"C1\", \"C2\", ...) -- use those labels, not the transcript markers, "
+        "for `cell` below.\n"
         f"{buggy_notebook_text}\n\n"
         "## Grading rules\n"
         "Read the write-up and list every distinct bug the participant reported, in "
         "the order they wrote them, one item per bug (if two entries describe the "
         "same underlying bug, count it once; if one entry bundles several separate "
         "bugs, split it). Copy or condense the participant's own title for the bug "
-        "into `bug`. Set `cell` to the N of the single cell (`--- ... cell N ---`) "
-        "the bug most centrally concerns — the write-up's own stated location if it "
-        "gives one and it checks out, otherwise the cell you'd point to yourself; "
-        "null only if no single cell is clearly the right one (the bug spans "
-        "several cells, or nothing in the notebook matches). Then score each item "
+        "into `bug`. Set `cell` to the notebook's own label (e.g. \"C4\") of the "
+        "single cell the bug most centrally concerns, exactly as it's written in "
+        "the notebook — the write-up's own stated location if it gives one and it "
+        "checks out, otherwise the cell you'd point to yourself; null only if no "
+        "single cell is clearly the right one (the bug spans several cells, or "
+        "nothing in the notebook matches). Then score each item "
         "on two independent yes/no points:\n"
         "- `is_real_bug` (+1): the reported issue is a genuine bug in the notebook — "
         "a flaw you can point to in the code that makes its results misleading or "
@@ -109,10 +113,11 @@ def grade_debug_writeup(client: Anthropic, buggy_notebook_text: str, writeup_md:
     """Grade one participant's debug write-up. Returns
     {"results": [{"section","criterion","max_pts","score","reasoning","cell"}, ...],
     "notes": str} — one result per bug the participant reported, scored 0-2
-    (+1 real bug, +1 valid fix). `cell` is the 0-based notebook cell (matching
-    notebook_to_html's "Cell N" labels) the bug refers to, or None if the model
-    couldn't tie it to one specific cell -- Admin's Debug sub-tab uses it to show
-    each bug alongside the cell it's about."""
+    (+1 real bug, +1 valid fix). `cell` is the notebook's own cell label (e.g.
+    "C4", as written in the notebook itself -- not a synthetic index) the bug
+    refers to, or None if the model couldn't tie it to one specific cell --
+    Admin's Debug sub-tab uses it to show each bug alongside the cell it's
+    about."""
     if not writeup_md.strip():
         return {"results": [], "notes": "The write-up is empty."}
     graded = _parse(
@@ -136,6 +141,6 @@ def grade_debug_writeup(client: Anthropic, buggy_notebook_text: str, writeup_md:
             "max_pts": MAX_PTS_PER_BUG,
             "score": int(real) + int(fix),
             "reasoning": f"Bug: {'✓' if real else '✗'} · Fix: {'✓' if fix else '✗'} — {g.reasoning.strip()}",
-            "cell": g.cell,
+            "cell": g.cell.strip() if g.cell and g.cell.strip() else None,
         })
     return {"results": results, "notes": graded.notes.strip()}

@@ -52,6 +52,7 @@ One page of the multipage app — run via `streamlit run app.py`.
 
 import base64
 import io
+import re
 
 import pandas as pd
 import streamlit as st
@@ -323,20 +324,28 @@ def _render_graded_rubric(results: list[dict], sid: str, name: str) -> None:
     )
 
 
+def _debug_cell_sort_key(cell) -> tuple:
+    """Natural order for the notebook's own cell labels ("C1", "C2", ... "C10",
+    not lexicographic "C1", "C10", "C2"); unlabeled (None) sorts last. Also
+    accepts a plain int, for grades made before cell became a label string."""
+    if cell is None:
+        return (1, "")
+    cell = str(cell)
+    m = re.search(r"\d+", cell)
+    return (0, int(m.group()), cell) if m else (0, float("inf"), cell)
+
+
 def _render_debug_bugs(results: list[dict], sid: str) -> None:
     """The debugging task's graded bugs, aligned with the notebook cell each one
-    is about -- grouped by cell number (ascending; bugs the grader couldn't tie
-    to one specific cell come last), so a cell's "Cell N" label in the notebook
-    view above lines up with its bugs here. Same score/criterion/reasoning row
-    layout as _render_graded_rubric, plus the cell number and a CSV download."""
-    def _sort_key(r: dict):
-        cell = r.get("cell")
-        return (1, 0) if cell is None else (0, cell)
-
-    for r in sorted(results, key=_sort_key):
+    is about -- grouped by the notebook's own cell label (e.g. "C4"), in order;
+    bugs the grader couldn't tie to one specific cell come last, so a cell as
+    labeled in the notebook view above lines up with its bugs here. Same
+    score/criterion/reasoning row layout as _render_graded_rubric, plus the
+    cell label and a CSV download."""
+    for r in sorted(results, key=lambda r: _debug_cell_sort_key(r.get("cell"))):
         cell = r.get("cell")
         c_cell, c_score, c_text = st.columns([1, 1, 6])
-        c_cell.markdown(f"**Cell {cell}**" if cell is not None else "_cell unclear_")
+        c_cell.markdown(f"**{cell}**" if cell is not None else "_cell unclear_")
         c_score.markdown(f"**{float(r.get('score') or 0):g} / {float(r.get('max_pts') or 0):g}**")
         c_text.markdown(f"**{r.get('criterion') or ''}**")
         if r.get("reasoning"):

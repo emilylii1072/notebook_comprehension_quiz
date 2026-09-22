@@ -416,11 +416,11 @@ alter table task_instructions add column if not exists notebook_html text;
 -- shows this instead of the raw flattened transcript.
 alter table participant_notebooks add column if not exists notebook_html text;
 
--- Which buggy-notebook cell (0-based, matching the "Cell N" labels
--- notebook_to_html inserts) a graded debugging bug refers to, folded into
--- participant_task_grades.results' per-bug objects by lib/debug_grading.py --
--- no column of its own, since results is already jsonb. Existing rows graded
--- before this simply have no "cell" key in each item; admin's Debug sub-tab
--- treats that the same as an unidentified cell.
+-- Which buggy-notebook cell a graded debugging bug refers to -- the notebook's
+-- own cell label as written in its content (e.g. "C4"), not a synthetic
+-- numbering -- folded into participant_task_grades.results' per-bug objects by
+-- lib/debug_grading.py; no column of its own, since results is already jsonb.
+-- Existing rows graded before this simply have no "cell" key in each item;
+-- admin's Debug sub-tab treats that the same as an unidentified cell.
 
 notify pgrst, 'reload schema';

@@ -53,22 +53,16 @@ def notebook_to_text(raw: bytes) -> str:
 
 
 def notebook_to_html(raw: bytes) -> str:
-    """Render a .ipynb as a single self-contained HTML page, for the participant
-    to view (a new browser tab, not the app itself) while debugging it.
+    """Render a .ipynb as a single self-contained HTML page -- for the
+    participant to view (a new browser tab, not the app itself) while
+    debugging it, and for Admin's Task notebook sub-tab.
 
-    A small "Cell N" label is inserted before every cell, using the same 0-based,
-    every-cell-type numbering as notebook_to_text's `--- ... cell N ---` markers --
-    so a cell number in a write-up or an answer key points at the same cell here
-    as it does in grading.
+    Rendered as-is, with no injected cell labels: the buggy notebook already
+    labels its own cells (C1, C2, ... in its actual content), which this just
+    shows like any other cell content -- see lib.debug_grading, which has the
+    grader read those same labels rather than a synthetic numbering.
     """
     nb = nbformat.reads(raw.decode("utf-8"), as_version=4)
-    labeled = []
-    for i, cell in enumerate(nb.cells):
-        label = nbformat.v4.new_markdown_cell(f"**Cell {i}**")
-        label.metadata["tags"] = ["cell-label"]
-        labeled.append(label)
-        labeled.append(cell)
-    nb.cells = labeled
     exporter = HTMLExporter(template_name="classic")
     exporter.exclude_input_prompt = True
     exporter.exclude_output_prompt = True
