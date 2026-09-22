@@ -33,6 +33,13 @@ def _missing_answer(item: SurveyItem, ss, a_key: str) -> str | None:
     other_needed = "Please fill in the text box."
     if item.kind == "notice" or item.optional:
         return None
+    if item.kind == "short_text" and item.min_value is not None:
+        value = ss.get(a_key)
+        if value is None:
+            return "An answer is required."
+        if not (item.min_value <= value <= item.max_value):
+            return f"Must be between {item.min_value} and {item.max_value}."
+        return None
     if item.kind in ("short_text", "long_text"):
         return None if (ss.get(a_key) or "").strip() else "An answer is required."
     if item.kind == "single_select":
@@ -157,6 +164,11 @@ def render_survey_flow(*, subject_id: str, survey_type: str, items: list[SurveyI
     a_key = f"{_k(survey_type, 'a')}{idx}"
     if item.kind == "notice":
         pass
+    elif item.kind == "short_text" and item.min_value is not None:
+        st.number_input(
+            "Your answer", min_value=item.min_value, max_value=item.max_value,
+            value=None, step=1, key=a_key, label_visibility="collapsed",
+        )
     elif item.kind == "short_text":
         st.text_input("Your answer", key=a_key, label_visibility="collapsed")
     elif item.kind == "long_text":

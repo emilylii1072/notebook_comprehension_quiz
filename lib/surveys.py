@@ -39,6 +39,8 @@ class SurveyItem:
     rows: list[str] | None = None         # matrix row statements
     free_text_options: tuple[str, ...] = ()  # choices that reveal a text box when chosen, e.g. ("Other",)
     optional: bool = False                # force=OFF in the .qsf -- skippable, not required to continue
+    min_value: int | None = None          # short_text only -- a ValidNumber range from the .qsf
+    max_value: int | None = None          # (both set together); rendered as a number input, not free text
 
 
 _KNOWLEDGE_NOTICE = (
@@ -80,6 +82,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
     SurveyItem(
         id="logistics_age", kind="short_text", category="Logistics",
         question="How old are you?",
+        min_value=18, max_value=99,
     ),
     SurveyItem(
         id="logistics_gender", kind="single_select", category="Logistics",
@@ -88,7 +91,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
         free_text_options=("Other (please specify)",),
     ),
     SurveyItem(
-        id="logistics_first_language", kind="single_select", category="Logistics",
+        id="logistics_first_language", kind="multi_select", category="Logistics",
         question="What is your first language?",
         options=[
             "English", "Chinese (Mandarin)", "Chinese (Cantonese)", "Spanish", "Japanese",
@@ -97,7 +100,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
         free_text_options=("Other",),
     ),
     SurveyItem(
-        id="logistics_occupation", kind="single_select", category="Logistics",
+        id="logistics_occupation", kind="multi_select", category="Logistics",
         question=(
             "What best describes your current occupation? If you are a student, "
             "indicate your major."
