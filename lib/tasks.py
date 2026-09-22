@@ -270,10 +270,16 @@ def render_notebook_link(nb_row: dict | None) -> None:
     """The Debugging task's "open the buggy notebook in a new tab" control -- the
     .ipynb participants are given, rendered to a self-contained HTML page
     (lib.notebook.notebook_to_html) and linked via a data: URI so no server route
-    is needed. Renders nothing if the admin hasn't uploaded a notebook yet, or
-    uploaded one before this feature existed (no HTML saved for it)."""
+    is needed. If the admin hasn't uploaded a notebook yet, or uploaded one before
+    this feature existed (no HTML saved for it), this says so instead of silently
+    rendering nothing -- a participant who can't see this needs to know it's
+    supposed to be there, not just miss it."""
     nb_html = (nb_row or {}).get("notebook_html")
     if not nb_html:
+        st.warning(
+            "The buggy notebook isn't available to view yet. Please tell the "
+            "researcher before continuing."
+        )
         return
     b64 = base64.b64encode(nb_html.encode("utf-8")).decode("ascii")
     st.markdown(

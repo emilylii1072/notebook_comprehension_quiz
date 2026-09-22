@@ -204,8 +204,6 @@ def render_task_screen(*, task_key: str, next_stage: str) -> None:
         get_task_instruction(k) for k in tasks.instruction_keys_for(task_key, condition)
     ]
     readable = tasks.render_instructions(instructions, task_key)
-    if task_key == tasks.DEBUG:
-        tasks.render_notebook_link(get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY))
 
     # Session state is empty in a browser session that didn't start the task, so
     # fall back to the stored row: someone resuming a task they already began
@@ -241,6 +239,8 @@ def render_task_screen(*, task_key: str, next_stage: str) -> None:
         "Leave this page open while you work. If it closes, re-enter your "
         "Subject ID — the clock keeps running from when you started."
     )
+    if task_key == tasks.DEBUG:
+        tasks.render_notebook_link(get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY))
     if st.button("I've finished — continue", type="primary"):
         finish_participant_task(sid, task_key)
         goto(next_stage)
