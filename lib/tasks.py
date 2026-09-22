@@ -266,14 +266,49 @@ def render_instructions(instructions: list[dict | None], task_key: str) -> bool:
     return True
 
 
+def render_notebook_open_button(
+    nb_html: str, *, label: str = "📓 Open the notebook in a new tab", key: str = "",
+) -> None:
+    """A button that opens `nb_html` (a full, self-contained page from
+    lib.notebook.notebook_to_html) in a new browser tab.
+
+    Not a data: URI on an <a href> -- that string counts against the browser's
+    max URL length, and a real rendered notebook is easily big enough to blow
+    past it (Chrome's is ~2MB; nbconvert's own CSS/JS already puts an empty
+    notebook well past a few hundred KB, before a single real cell or embedded
+    image), which makes the link silently invalid with no clear error. Instead
+    this hands the (base64'd) HTML to a small script, which decodes it into a
+    Blob and opens an object URL for it -- the content lives in the browser's
+    memory, not in a URL, so there's no such limit.
+    """
+    b64 = base64.b64encode(nb_html.encode("utf-8")).decode("ascii")
+    btn_id = f"nb-open-{key or 'btn'}"
+    page = f"""
+    <div style="font-family: 'Source Sans Pro', system-ui, -apple-system, sans-serif;">
+      <button id="{btn_id}" style="font-size: 15px; font-weight: 600; padding: 8px 14px;
+        border-radius: 8px; border: 1px solid #8a8a8a; background: transparent;
+        color: inherit; cursor: pointer;">{label}</button>
+    </div>
+    <script>
+    document.getElementById("{btn_id}").addEventListener("click", function () {{
+      var binary = atob("{b64}");
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) {{ bytes[i] = binary.charCodeAt(i); }}
+      var blob = new Blob([bytes], {{type: "text/html;charset=utf-8"}});
+      window.open(URL.createObjectURL(blob), "_blank");
+    }});
+    </script>
+    """
+    components.html(page, height=52)
+
+
 def render_notebook_link(nb_row: dict | None) -> None:
     """The Debugging task's "open the buggy notebook in a new tab" control -- the
     .ipynb participants are given, rendered to a self-contained HTML page
-    (lib.notebook.notebook_to_html) and linked via a data: URI so no server route
-    is needed. If the admin hasn't uploaded a notebook yet, or uploaded one before
-    this feature existed (no HTML saved for it), this says so instead of silently
-    rendering nothing -- a participant who can't see this needs to know it's
-    supposed to be there, not just miss it."""
+    (lib.notebook.notebook_to_html). If the admin hasn't uploaded a notebook
+    yet, or uploaded one before this feature existed (no HTML saved for it),
+    this says so instead of silently rendering nothing -- a participant who
+    can't see this needs to know it's supposed to be there, not just miss it."""
     nb_html = (nb_row or {}).get("notebook_html")
     if not nb_html:
         st.warning(
@@ -281,10 +316,11 @@ def render_notebook_link(nb_row: dict | None) -> None:
             "researcher before continuing."
         )
         return
-    b64 = base64.b64encode(nb_html.encode("utf-8")).decode("ascii")
-    st.markdown(
-        f'📓 <a href="data:text/html;base64,{b64}" target="_blank" rel="noopener">'
-        "<strong>Open the buggy notebook in a new tab</strong></a>",
-        unsafe_allow_html=True,
+    render_notebook_open_button(
+        nb_html, label="📓 Open the buggy notebook in a new tab", key="buggy",
     )
     st.caption("Keep it open alongside this page while you look for bugs.")
+    st.download_button(
+        "⬇️ Or download it", data=nb_html.encode("utf-8"), file_name="buggy_notebook.html",
+        mime="text/html", key="dl_buggy_notebook",
+    )

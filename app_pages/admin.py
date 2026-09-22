@@ -50,7 +50,6 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Seven top-level tabs:
 One page of the multipage app — run via `streamlit run app.py`.
 """
 
-import base64
 import io
 import re
 
@@ -282,18 +281,20 @@ def _grade_task_for(subject_id: str, task_key: str, text: str) -> tuple[bool, st
 
 def _render_notebook_html(html: str | None, *, key: str, height: int = 650) -> None:
     """A rendered notebook (lib.notebook.notebook_to_html): an "open in a new
-    tab" link (data: URI, no server route needed) plus an inline, collapsed
-    preview so admin doesn't have to leave the page to check it. Renders a
-    caption instead when there's no HTML saved for this notebook yet (older
-    participants, or one uploaded before this feature existed)."""
+    tab" button (tasks.render_notebook_open_button -- a Blob URL, not a data:
+    URI, since a real notebook's HTML is easily big enough to exceed the
+    browser's max URL length and make a data: link silently invalid) plus a
+    download fallback and an inline, collapsed preview so admin doesn't have to
+    leave the page to check it. Renders a caption instead when there's no HTML
+    saved for this notebook yet (older participants, or one uploaded before
+    this feature existed)."""
     if not html:
         st.caption("No rendered HTML for this notebook yet — re-upload it to generate one.")
         return
-    b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
-    st.markdown(
-        f'📓 <a href="data:text/html;base64,{b64}" target="_blank" rel="noopener">'
-        "<strong>Open the notebook in a new tab</strong></a>",
-        unsafe_allow_html=True,
+    tasks.render_notebook_open_button(html, key=key)
+    st.download_button(
+        "⬇️ Or download it", data=html.encode("utf-8"), file_name=f"{key}.html",
+        mime="text/html", key=f"dl_nbhtml_{key}",
     )
     with st.expander("View inline", key=f"nb_inline_{key}"):
         components.html(html, height=height, scrolling=True)
