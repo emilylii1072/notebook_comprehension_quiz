@@ -2,6 +2,7 @@
 streamlit>=1.37
 anthropic>=1.4          # messages.parse structured outputs + long-request timeout guard
 nbformat>=5.9
+nbconvert>=7.0          # renders the buggy notebook to HTML for participants to view
 pydantic>=2.0
 python-dotenv>=1.0
 plotly>=5.20

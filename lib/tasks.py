@@ -13,6 +13,7 @@ Instruction content is admin-authored (Admin > Task instructions, stored in the
 around it.
 """
 
+import base64
 import html
 import time
 
@@ -35,8 +36,14 @@ TASK_TITLE = {
     DEBUG: "Debugging task",
 }
 
-# task_instructions.task_key for the main task, per assigned condition. The
-# participant only ever sees the one matching their condition.
+# task_instructions.task_key for the main task's one shared brief (the task
+# itself -- data, goal, deliverable -- the same for every condition).
+MAIN_BRIEF_KEY = "main_task_brief"
+
+# task_instructions.task_key for the main task's condition instructions (how to
+# go about it), per assigned condition. The participant sees the shared brief
+# plus the one condition document matching their condition, one after another
+# on the same page -- see instruction_keys_for / render_instructions.
 MAIN_INSTRUCTION_KEY = {
     "slow_planning": "main_slow_planning",
     "slow_iterating": "main_slow_iterating",
@@ -45,29 +52,35 @@ MAIN_INSTRUCTION_KEY = {
 
 # Every instruction document Admin can upload, in the order it's presented.
 INSTRUCTION_KEYS: list[tuple[str, str]] = [
-    ("main_slow_planning", "Main task — Slow planning"),
-    ("main_slow_iterating", "Main task — Slow iterating"),
-    ("main_control", "Main task — Control"),
+    (MAIN_BRIEF_KEY, "Main task — Task brief (shown to every condition)"),
+    ("main_slow_planning", "Main task — Condition instructions: Slow planning"),
+    ("main_slow_iterating", "Main task — Condition instructions: Slow iterating"),
+    ("main_control", "Main task — Condition instructions: Control"),
     ("ideate", "Idea generation task"),
     ("debug", "Debugging task"),
 ]
 INSTRUCTION_TITLE = dict(INSTRUCTION_KEYS)
 
-# Admin-only grading material for the debugging task, kept in task_instructions
-# beside the participant-facing documents but never shown to a participant and
-# deliberately not in INSTRUCTION_KEYS (a task can start without it).
-# DEBUG_NOTEBOOK_KEY: the buggy notebook, flattened by lib.notebook.notebook_to_text
-# (title = the uploaded filename), which the grader reads each write-up against.
+# Admin-uploaded grading/reference material, kept in task_instructions beside
+# the participant-facing documents but deliberately not in INSTRUCTION_KEYS (a
+# task can start without it). DEBUG_NOTEBOOK_KEY: the buggy notebook (title =
+# the uploaded filename) -- its flattened text (lib.notebook.notebook_to_text)
+# is what the grader reads each write-up against; its rendered HTML
+# (lib.notebook.notebook_to_html, `notebook_html` column) is what
+# render_notebook_link offers the participant to view during the debugging task.
 DEBUG_NOTEBOOK_KEY = "debug_notebook"
 # The rubric the ideation pitch transcript is scored against, verbatim.
 IDEATE_RUBRIC_KEY = "ideate_rubric"
 
 
-def instruction_key_for(task_key: str, condition: str | None) -> str | None:
-    """Which uploaded document a given task screen should show."""
+def instruction_keys_for(task_key: str, condition: str | None) -> list[str]:
+    """Which uploaded document(s) a given task screen should show, in the order
+    they're shown. The main task shows two: the shared brief, then the
+    condition instructions matching the participant's assigned condition.
+    Ideation and debugging each show their one shared document."""
     if task_key == MAIN:
-        return MAIN_INSTRUCTION_KEY.get(condition or "")
-    return task_key if task_key in (IDEATE, DEBUG) else None
+        return [MAIN_BRIEF_KEY, MAIN_INSTRUCTION_KEY.get(condition or "")]
+    return [task_key] if task_key in (IDEATE, DEBUG) else []
 
 
 def format_duration(seconds: float | None) -> str:
@@ -232,18 +245,40 @@ _COUNTDOWN_HTML = """
 """
 
 
-def render_instructions(instruction: dict | None, task_key: str) -> bool:
-    """Show one admin-uploaded task document. Returns False (and says so) when
-    nothing has been uploaded for it yet, so the caller can refuse to start a
-    task the participant can't actually read."""
-    if instruction is None or not (instruction.get("content") or "").strip():
+def render_instructions(instructions: list[dict | None], task_key: str) -> bool:
+    """Show one or more admin-uploaded task documents, in order, one after
+    another on the same page (the main task shows its shared brief followed by
+    the participant's condition instructions; ideation and debugging each show
+    their one shared document). Returns False (and says so, rendering nothing)
+    when any of them hasn't been uploaded yet, so the caller can refuse to
+    start a task the participant can't actually read."""
+    if any(doc is None or not (doc.get("content") or "").strip() for doc in instructions):
         st.error(
             f"The {TASK_TITLE.get(task_key, task_key)} instructions haven't been "
             "uploaded yet. Please tell the researcher before continuing."
         )
         return False
-    title = (instruction.get("title") or "").strip()
-    if title:
-        st.markdown(f"### {title}")
-    st.markdown(instruction["content"])
+    for doc in instructions:
+        title = (doc.get("title") or "").strip()
+        if title:
+            st.markdown(f"### {title}")
+        st.markdown(doc["content"])
     return True
+
+
+def render_notebook_link(nb_row: dict | None) -> None:
+    """The Debugging task's "open the buggy notebook in a new tab" control -- the
+    .ipynb participants are given, rendered to a self-contained HTML page
+    (lib.notebook.notebook_to_html) and linked via a data: URI so no server route
+    is needed. Renders nothing if the admin hasn't uploaded a notebook yet, or
+    uploaded one before this feature existed (no HTML saved for it)."""
+    nb_html = (nb_row or {}).get("notebook_html")
+    if not nb_html:
+        return
+    b64 = base64.b64encode(nb_html.encode("utf-8")).decode("ascii")
+    st.markdown(
+        f'📓 <a href="data:text/html;base64,{b64}" target="_blank" rel="noopener">'
+        "<strong>Open the buggy notebook in a new tab</strong></a>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Keep it open alongside this page while you look for bugs.")

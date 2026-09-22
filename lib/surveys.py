@@ -1,23 +1,29 @@
 """Fixed content for the pre- and post-study surveys.
 
-Transcribed directly from the study's two Qualtrics print-preview PDFs
-("Delegations Pre Survey.pdf" / "Delegations Post Survey.pdf") -- no LLM
-generation, no admin editing. The small italicized prefixes in the PDF
-("Logistics.", "AI trust.", "Machine Learning 2.", etc.) are `category` tags
-kept for analysis, not part of the question text; where the PDF shows no
-prefix, `category` is None.
+Transcribed directly from the study's two Qualtrics survey exports
+("Delegations_Pre-Survey.qsf" / "Delegations_Post-Survey.qsf") -- no LLM
+generation, no admin editing. Each .qsf's Survey Flow names which blocks are
+actually administered; a "Trash / Unused Questions" block in both files holds
+retired questions (an old code-snippet item, a duplicate p-value item, "What
+parts did the AI do for this task?", ...) that are no longer part of either
+survey and are not transcribed here. The small italicized prefixes on each
+question ("Logistics", "AI trust", "Machine Learning 2", etc. -- Qualtrics'
+"Data Export Tag") are kept as `category` for analysis, not part of the
+question text; where the export sets no tag, `category` is None.
 
-Two content decisions confirmed with the researcher, since the PDF's tables
-were split awkwardly across print pages: the post-survey's repeated "I
-understand why the analysis produced its conclusions." row is a pagination
-artifact (asked once here, not twice), and all four post-survey workload
-blocks share the same 5 sub-questions. The pre-survey's "How frequently do you
-use each of these skills" question had an unlabeled 5th scale point in the
-PDF ("Click to write Scale Point 5", never filled in) -- the researcher
-specified it should be "Daily".
+One content decision: the post-survey's "Confidence" matrix (QID7) repeats "I
+understand why the analysis produced its conclusions." as both its 1st and
+4th row -- a pagination artifact from an earlier print layout -- so it's
+asked once here, not twice. Its 5th/6th rows also read "...for the same task
+task with/without AI assistance" (a doubled word) in the .qsf; transcribed
+here as "task" once. All four post-survey workload ("Experience") blocks
+share the same 5 sub-questions, though the 3rd ("How irritated...") is worded
+per-task ("task" vs "tasks") exactly as each block has it.
 
-Subject ID is never re-asked here -- the participant already entered it at
-the "identify" stage of app_pages/participant.py.
+A question with `force=OFF` in its .qsf Validation settings is optional here
+(`SurveyItem.optional=True`); everything else is required. Subject ID is
+never re-asked here -- the participant already entered it at the "identify"
+stage of app_pages/participant.py.
 """
 
 from dataclasses import dataclass
@@ -31,7 +37,8 @@ class SurveyItem:
     category: str | None = None
     options: list[str] | None = None      # single/multi_select choices, or a matrix's column scale
     rows: list[str] | None = None         # matrix row statements
-    free_text_option: str | None = None   # e.g. "Other" -- reveals a text box when that option is chosen
+    free_text_options: tuple[str, ...] = ()  # choices that reveal a text box when chosen, e.g. ("Other",)
+    optional: bool = False                # force=OFF in the .qsf -- skippable, not required to continue
 
 
 _KNOWLEDGE_NOTICE = (
@@ -78,7 +85,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
         id="logistics_gender", kind="single_select", category="Logistics",
         question="What is your gender?",
         options=["Male", "Female", "Other (please specify)", "Prefer not to say"],
-        free_text_option="Other (please specify)",
+        free_text_options=("Other (please specify)",),
     ),
     SurveyItem(
         id="logistics_first_language", kind="single_select", category="Logistics",
@@ -87,7 +94,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
             "English", "Chinese (Mandarin)", "Chinese (Cantonese)", "Spanish", "Japanese",
             "Hindi", "Korean", "Arabic", "German", "Italian", "Other",
         ],
-        free_text_option="Other",
+        free_text_options=("Other",),
     ),
     SurveyItem(
         id="logistics_occupation", kind="single_select", category="Logistics",
@@ -97,9 +104,9 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
         ),
         options=[
             "Data Scientist / Analyst", "Software Engineering", "Product Managing",
-            "Designer / Researcher", "Student",
+            "Designer / Researcher", "Student", "Other",
         ],
-        free_text_option="Student",
+        free_text_options=("Student", "Other"),
     ),
     SurveyItem(
         id="prior_experience_ds_level", kind="single_select", category="Prior experience",
@@ -142,7 +149,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
             "None",
             "Other",
         ],
-        free_text_option="Other",
+        free_text_options=("Other",),
     ),
     SurveyItem(
         id="ai_collab_role", kind="single_select", category="AI collab",
@@ -156,7 +163,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
             "majority of your time interacting with AI?"
         ),
         options=["Plan myself + AI implements", "AI implements + I evaluate", "Other"],
-        free_text_option="Other",
+        free_text_options=("Other",),
     ),
     SurveyItem(
         id="ai_collab_learn_strategies", kind="matrix", category="AI collab",
@@ -171,6 +178,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
             "Extremely unlikely", "Unlikely", "Slightly Unlikely", "Neutral",
             "Slightly likely", "Likely", "Extremely likely",
         ],
+        optional=True,
     ),
     SurveyItem(id="pre_knowledge_notice", kind="notice", question=_KNOWLEDGE_NOTICE),
     SurveyItem(
@@ -276,6 +284,7 @@ PRE_SURVEY_ITEMS: list[SurveyItem] = [
             "test set and reports."
         ),
         options=["Yes", "No", "I don't know"],
+        optional=True,
     ),
 ]
 
@@ -388,17 +397,8 @@ POST_SURVEY_ITEMS: list[SurveyItem] = [
         options=["Yes", "No", "I don't know"],
     ),
     SurveyItem(
-        id="post_ai_parts", kind="multi_select",
-        question="What parts did the AI do for this task?",
-        options=[
-            "Understanding the task", "Planning steps", "Writing prompts", "Revising prompts",
-            "Generating code", "Explaining code", "Deciding next steps", "Checking for errors", "Other",
-        ],
-        free_text_option="Other",
-    ),
-    SurveyItem(
-        id="post_confidence_matrix", kind="matrix",
-        question="How much do you agree/disagree with the following statements:",
+        id="post_confidence_matrix", kind="matrix", category="AI trust",
+        question="Please rate the following in terms of how much you agree or disagree with each statement.",
         rows=[
             "I am confident in my ability to use GenAI/LLMs.",
             "I am comfortable letting an AI tool suggest what to do next in a task.",
@@ -407,19 +407,12 @@ POST_SURVEY_ITEMS: list[SurveyItem] = [
         options=_AGREE_5,
     ),
     SurveyItem(
-        id="post_understanding_matrix", kind="matrix",
+        id="post_reflection_matrix", kind="matrix", category="Confidence",
         question="How much do you agree/disagree with the following statements:",
         rows=[
             "I understand why the analysis produced its conclusions.",
             "I could explain the analysis to another person without relying on the AI.",
             "I actively checked whether the AI's outputs were correct.",
-        ],
-        options=_AGREE_5_REVERSED,
-    ),
-    SurveyItem(
-        id="post_code_review_matrix", kind="matrix",
-        question="How much do you agree/disagree with the following statements:",
-        rows=[
             "I am comfortable code reviewing other people's Python notebooks for the same task with AI assistance",
             "I am comfortable code reviewing other people's Python notebooks for the same task without AI assistance",
             "I am comfortable generating new analysis ideas based on what I learned from this task.",
@@ -430,9 +423,10 @@ POST_SURVEY_ITEMS: list[SurveyItem] = [
         id="post_ai_role", kind="single_select",
         question="Reflecting on your experience with the tasks today, which best describes the role of AI agents?",
         options=_AI_ROLE_OPTIONS,
+        optional=True,
     ),
     _workload_block("workload_main_task", "the main task (Python notebook)", "task"),
-    _workload_block("workload_idea_gen", "the idea generation task", "task"),
+    _workload_block("workload_idea_gen", "the idea generation task", "tasks"),
     _workload_block("workload_debugging", "the debugging task", "tasks"),
     _workload_block(
         "workload_interview",
@@ -458,7 +452,10 @@ POST_SURVEY_ITEMS: list[SurveyItem] = [
         id="post_demanding_part", kind="long_text",
         question="Did you find any part of the task particularly demanding / challenging?",
     ),
-    SurveyItem(id="post_other_comments", kind="long_text", question="Anything else you want to share?"),
+    SurveyItem(
+        id="post_other_comments", kind="long_text", question="Anything else you want to share?",
+        optional=True,
+    ),
 ]
 
 
@@ -466,8 +463,8 @@ POST_SURVEY_ITEMS: list[SurveyItem] = [
 # Scoring the knowledge assessments
 # ---------------------------------------------------------------------------
 #
-# The Qualtrics PDFs record the questions but not the answer key, so the key
-# below was written out here rather than transcribed. Every entry is a standard
+# The Qualtrics exports record the questions but not the answer key, so the
+# key below was written out here rather than transcribed. Every entry is a standard
 # data-science fact with one defensible answer (the ML6 pipeline item is "No"
 # because it both leaks the test set through whole-dataset imputation/scaling
 # and splits into 100%/20%), but it is a judgement call rather than a source

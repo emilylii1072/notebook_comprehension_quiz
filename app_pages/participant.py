@@ -200,8 +200,12 @@ def render_task_screen(*, task_key: str, next_stage: str) -> None:
     condition = st.session_state.condition
     limit = tasks.TASK_LIMIT_SECONDS[task_key]
 
-    instruction = get_task_instruction(tasks.instruction_key_for(task_key, condition))
-    readable = tasks.render_instructions(instruction, task_key)
+    instructions = [
+        get_task_instruction(k) for k in tasks.instruction_keys_for(task_key, condition)
+    ]
+    readable = tasks.render_instructions(instructions, task_key)
+    if task_key == tasks.DEBUG:
+        tasks.render_notebook_link(get_task_instruction(tasks.DEBUG_NOTEBOOK_KEY))
 
     # Session state is empty in a browser session that didn't start the task, so
     # fall back to the stored row: someone resuming a task they already began

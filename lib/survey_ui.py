@@ -1,7 +1,9 @@
 """The in-app pre-/post-survey experience: one item per screen, a stopwatch,
 per-item elapsed time recorded, saved once at the end. Every question is
-required -- `_missing_answer` keeps the Next/Submit button disabled, and says
-what is still outstanding, until the item is complete. Mirrors
+required unless `SurveyItem.optional` is set (mirrors force=OFF in the
+source .qsf) -- `_missing_answer` keeps the Next/Submit button disabled, and
+says what is still outstanding, until the item is complete, but always lets
+an optional item through unanswered. Mirrors
 lib/quiz_ui.py's flow (`_record_current_answer` / question-start-time
 tracking), generalized to the handful of question kinds lib/surveys.py uses
 instead of quiz.py's single multiple-choice kind -- there's no LLM generation
@@ -24,12 +26,12 @@ def _k(survey_type: str, name: str) -> str:
 
 
 def _missing_answer(item: SurveyItem, ss, a_key: str) -> str | None:
-    """Why this item isn't answered yet, or None if it is. Every question is
-    required -- the Next/Submit button stays disabled until this returns None.
-    A matrix needs every row rated, and picking a free-text option ("Other",
-    "Student", ...) also requires filling the box it reveals."""
+    """Why this item isn't answered yet, or None if it is (including every
+    optional item, unconditionally). A matrix needs every row rated, and
+    picking a free-text option ("Other", "Student", ...) also requires filling
+    the box it reveals."""
     other_needed = "Please fill in the text box."
-    if item.kind == "notice":
+    if item.kind == "notice" or item.optional:
         return None
     if item.kind in ("short_text", "long_text"):
         return None if (ss.get(a_key) or "").strip() else "An answer is required."
@@ -37,14 +39,14 @@ def _missing_answer(item: SurveyItem, ss, a_key: str) -> str | None:
         selected = ss.get(a_key)
         if selected is None:
             return "Select an option to continue."
-        if item.free_text_option and selected == item.free_text_option:
+        if selected in item.free_text_options:
             return None if (ss.get(f"{a_key}_other") or "").strip() else other_needed
         return None
     if item.kind == "multi_select":
         chosen = [opt for opt in (item.options or []) if ss.get(f"{a_key}_{opt}")]
         if not chosen:
             return "Select at least one option to continue."
-        if item.free_text_option and item.free_text_option in chosen:
+        if any(opt in item.free_text_options for opt in chosen):
             return None if (ss.get(f"{a_key}_other") or "").strip() else other_needed
         return None
     if item.kind == "matrix":
@@ -70,13 +72,17 @@ def _record_current_answer(survey_type: str) -> None:
         selected = ss.get(a_key)
         other = (
             ss.get(f"{a_key}_other", "")
-            if item.free_text_option and selected == item.free_text_option
+            if selected in item.free_text_options
             else None
         )
         answers[idx] = {"selected": selected, "other_text": other}
     elif item.kind == "multi_select":
         selected = [opt for opt in (item.options or []) if ss.get(f"{a_key}_{opt}")]
-        other = ss.get(f"{a_key}_other", "") if item.free_text_option in selected else None
+        other = (
+            ss.get(f"{a_key}_other", "")
+            if any(opt in item.free_text_options for opt in selected)
+            else None
+        )
         answers[idx] = {"selected": selected, "other_text": other}
     elif item.kind == "matrix":
         answers[idx] = {
@@ -141,7 +147,11 @@ def render_survey_flow(*, subject_id: str, survey_type: str, items: list[SurveyI
         start_times[idx] = time.time()
 
     if item.kind != "notice":
-        st.caption(f"Question {idx + 1} of {len(items)}" + (f" · _{item.category}_" if item.category else ""))
+        st.caption(
+            f"Question {idx + 1} of {len(items)}"
+            + (f" · _{item.category}_" if item.category else "")
+            + (" · optional" if item.optional else "")
+        )
     st.markdown(item.question)
 
     a_key = f"{_k(survey_type, 'a')}{idx}"
@@ -156,12 +166,12 @@ def render_survey_flow(*, subject_id: str, survey_type: str, items: list[SurveyI
             "Select one:", item.options or [], index=None, key=a_key,
             label_visibility="collapsed",
         )
-        if item.free_text_option and ss.get(a_key) == item.free_text_option:
+        if ss.get(a_key) in item.free_text_options:
             st.text_input("Please specify:", key=f"{a_key}_other")
     elif item.kind == "multi_select":
         for opt in item.options or []:
             st.checkbox(opt, key=f"{a_key}_{opt}")
-        if item.free_text_option and ss.get(f"{a_key}_{item.free_text_option}"):
+        if any(ss.get(f"{a_key}_{opt}") for opt in item.free_text_options):
             st.text_input("Please specify:", key=f"{a_key}_other")
     elif item.kind == "matrix":
         for i, row in enumerate(item.rows or []):

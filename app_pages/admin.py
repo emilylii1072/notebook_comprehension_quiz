@@ -34,9 +34,11 @@ Password-gated (set ADMIN_PASSWORD in secrets / .env). Seven top-level tabs:
                        workload, self-assessed vs rubric grade, background,
                        free text, and a long-format CSV export
   5. Task instructions — the markdown each task screen shows the participant:
-                       one main-task document per condition plus the shared
-                       ideation and debugging ones (lib/tasks.py). Participants
-                       cannot start a task whose document is missing.
+                       a shared main-task brief plus one condition-instructions
+                       document per condition (shown together on one page) and
+                       the shared ideation and debugging ones (lib/tasks.py).
+                       Participants cannot start a task whose document is
+                       missing.
   6. Notebook report — the visual grading report across all graded notebooks
   7. Grading         — browse/upload any rubric version, grade or re-grade
                        (individually or in bulk) against whichever one you pick;
@@ -94,7 +96,7 @@ from lib import (
     annotate, cohort, debug_grading, grading, ideate_grading, survey_stats, tasks, transcript,
 )
 from lib.llm import get_client
-from lib.notebook import notebook_has_content, notebook_to_text
+from lib.notebook import notebook_has_content, notebook_to_html, notebook_to_text
 from lib.quiz_ui import render_quiz_breakdown
 from lib.survey_ui import render_survey_breakdown
 from lib.timeline import (
@@ -274,6 +276,31 @@ def _grade_task_for(subject_id: str, task_key: str, text: str) -> tuple[bool, st
     return (ok, f"graded: {total:g} / {mx:g}" if ok else (err or "save failed"))
 
 
+def _render_graded_rubric(results: list[dict], sid: str, name: str) -> None:
+    """A filled-in rubric as readable rows — score, criterion, and the grader's full
+    reasoning, grouped by section — rather than a table that clips long cells, plus
+    a CSV download of the same rows."""
+    by_section: dict[str, list[dict]] = {}
+    for r in results:
+        by_section.setdefault((r.get("section") or "").strip(), []).append(r)
+    for section, items in by_section.items():
+        if section:
+            got = sum(float(i.get("score") or 0) for i in items)
+            mx = sum(float(i.get("max_pts") or 0) for i in items)
+            st.markdown(f"**{section}** — {got:g} / {mx:g}")
+        for i in items:
+            c_score, c_text = st.columns([1, 7])
+            c_score.markdown(f"**{float(i.get('score') or 0):g} / {float(i.get('max_pts') or 0):g}**")
+            c_text.markdown(f"**{i.get('criterion') or ''}**")
+            if i.get("reasoning"):
+                c_text.markdown(i["reasoning"])
+    csv = pd.DataFrame(results)[["section", "criterion", "score", "max_pts", "reasoning"]]
+    st.download_button(
+        "⬇️ Download graded rubric (CSV)", data=csv.to_csv(index=False).encode("utf-8"),
+        file_name=f"{sid}_{name}_graded.csv", mime="text/csv", key=f"dl_graded_{name}_{sid}",
+    )
+
+
 def _render_task_grade(sid: str, task_key: str, doc: dict | None) -> None:
     """The Autograde block under a participant's debugging write-up or ideation pitch
     transcript: the stored grade if any, and a (re-)grade button once the admin's
@@ -298,10 +325,7 @@ def _render_task_grade(sid: str, task_key: str, doc: dict | None) -> None:
     if grade:
         st.metric("Total", f"{grade['total_score']:g} / {grade['max_score']:g}")
         if grade["results"]:
-            st.dataframe(
-                pd.DataFrame(grade["results"])[["criterion", "score", "max_pts", "reasoning"]],
-                hide_index=True, width="stretch",
-            )
+            _render_graded_rubric(grade["results"], sid, task_key)
         else:
             st.caption("No bugs were reported in this write-up.")
         if grade.get("notes"):
@@ -622,11 +646,8 @@ with tab_detail:
                 )
                 st.caption(f"Graded against rubric `{nb.get('rubric_name', '?')}`.")
                 cohort.render_participant_notebook_sections(nb["results"], _section_rows, sid)
-                with st.expander("Per-criterion detail"):
-                    gdf = pd.DataFrame(nb["results"])[
-                        ["section", "criterion", "score", "max_pts", "reasoning"]
-                    ]
-                    st.dataframe(gdf, hide_index=True, width="stretch")
+                st.markdown("#### Graded rubric")
+                _render_graded_rubric(nb["results"], sid, "notebook")
                 if nb.get("notebook_text"):
                     with st.expander("Notebook transcript (as graded)"):
                         st.code(nb["notebook_text"])
@@ -912,15 +933,17 @@ with tab_surveys:
 # ---- Tab 5: Task instructions ---------------------------------------
 with tab_tasks:
     st.markdown(
-        "What the participant reads before each task. The main task has one "
-        "document per condition — a participant only ever sees the one matching "
-        "the condition they were assigned. Ideation and debugging are shared "
-        "across conditions."
+        "What the participant reads before each task. The main task shows two "
+        "documents on one page: a shared task brief (the task itself, the same "
+        "for every condition) followed by that participant's condition "
+        "instructions (how to go about it) — only the one matching the "
+        "condition they were assigned. Ideation and debugging are each one "
+        "document, shared across conditions."
     )
     st.caption(
         "Markdown, rendered to the participant exactly as previewed here. A task "
-        "whose document is missing cannot be started, so upload all five before "
-        "running anyone."
+        f"whose document is missing cannot be started, so upload all "
+        f"{len(tasks.INSTRUCTION_KEYS)} before running anyone."
     )
 
     # Saving reruns immediately to refresh the previews, which would wipe the
@@ -937,7 +960,7 @@ with tab_tasks:
             + ", ".join(f"**{tasks.INSTRUCTION_TITLE[k]}**" for k in _missing)
         )
     else:
-        st.success("All five task documents are uploaded.")
+        st.success(f"All {len(tasks.INSTRUCTION_KEYS)} task documents are uploaded.")
 
     for _key, _title in tasks.INSTRUCTION_KEYS:
         _row = _instructions.get(_key)
@@ -986,14 +1009,15 @@ with tab_tasks:
                 )
                 st.rerun()
 
-    # -- Debugging task: the buggy notebook, for autograding ------
+    # -- Debugging task: the buggy notebook, shown to participants + used for autograding ------
     st.divider()
-    st.markdown("### 🐞 Debugging task — grading material")
+    st.markdown("### 🐞 Debugging task — the buggy notebook")
     st.caption(
-        "Admin only — never shown to a participant. Upload the buggy notebook "
-        "participants debug. Claude reads it alongside each write-up, finds every bug "
+        "Upload the buggy notebook participants debug. It's rendered to HTML and "
+        "offered to participants as an \"open in a new tab\" link on the Debugging "
+        "task screen. Claude also reads it alongside each write-up, finds every bug "
         "the participant reported, and scores each one: +1 if it is a real bug, +1 if "
-        "the fix is valid (max 2 per reported bug)."
+        "the fix is valid (max 2 per reported bug) -- that grading use stays admin-only."
     )
     _dbg_nb = _instructions.get(tasks.DEBUG_NOTEBOOK_KEY)
 
@@ -1006,15 +1030,23 @@ with tab_tasks:
             )
         _dbg_up = st.file_uploader("Upload the buggy notebook (.ipynb)", type=["ipynb"], key="dbg_nb_up")
         if _dbg_up is not None and st.button("Save notebook", type="primary", key="dbg_nb_save"):
+            _dbg_bytes = _dbg_up.getvalue()
             try:
-                _dbg_text = notebook_to_text(_dbg_up.getvalue())
+                _dbg_text = notebook_to_text(_dbg_bytes)
             except Exception as e:
                 st.session_state["_task_save_msg"] = (False, f"Could not read notebook: {e}")
                 st.rerun()
             if not notebook_has_content(_dbg_text):
                 st.session_state["_task_save_msg"] = (False, "That notebook has no content — every cell is blank.")
             else:
-                ok, err = save_task_instruction(tasks.DEBUG_NOTEBOOK_KEY, _dbg_text, _dbg_up.name)
+                try:
+                    _dbg_html = notebook_to_html(_dbg_bytes)
+                except Exception as e:
+                    st.session_state["_task_save_msg"] = (False, f"Could not render notebook to HTML: {e}")
+                    st.rerun()
+                ok, err = save_task_instruction(
+                    tasks.DEBUG_NOTEBOOK_KEY, _dbg_text, _dbg_up.name, notebook_html=_dbg_html
+                )
                 st.session_state["_task_save_msg"] = (
                     ok, "Saved the buggy notebook." if ok else f"Not saved: {err}"
                 )
@@ -1022,6 +1054,10 @@ with tab_tasks:
         if _dbg_nb:
             with st.expander("Notebook as the grader sees it (flattened, with cell numbers)"):
                 st.code(_dbg_nb["content"])
+            if _dbg_nb.get("notebook_html"):
+                st.caption("✅ Rendered HTML is saved — participants can open it from the Debugging task screen.")
+            else:
+                st.caption("⚠️ No rendered HTML saved yet — re-upload the notebook to generate it.")
             if st.button("🗑️ Delete notebook", key="dbg_nb_del"):
                 ok, err = delete_task_instruction(tasks.DEBUG_NOTEBOOK_KEY)
                 st.session_state["_task_save_msg"] = (

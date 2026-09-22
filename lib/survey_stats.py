@@ -627,17 +627,21 @@ def render_self_assessment(rows: list[dict], summaries: list[dict]) -> None:
         .sort_values("subject_id"), hide_index=True, width="stretch",
     )
 
+    # "post_ai_parts" ("What parts did the AI do for this task?") was retired from
+    # the live post-survey and is no longer in ITEMS_BY_ID -- this chart only
+    # still has anything to show for participants run before that change.
     st.markdown("**What the AI did for the task**")
     sel = select_long(rows)
     parts = sel[sel["item_id"] == "post_ai_parts"]
     if parts.empty:
-        st.caption("No answers yet.")
+        st.caption("No answers yet (this question is no longer asked).")
         return
     n_resp = parts["subject_id"].nunique()
     counts = parts.groupby("option").size().reset_index(name="n")
     counts["pct"] = (100 * counts["n"] / n_resp).round(1)
-    opts = ITEMS_BY_ID["post_ai_parts"].options or []
-    order = [o for o in opts if o in set(counts["option"])]
+    legacy_item = ITEMS_BY_ID.get("post_ai_parts")
+    opts = legacy_item.options if legacy_item else []
+    order = [o for o in opts if o in set(counts["option"])] or sorted(counts["option"])
     fig = px.bar(
         counts, x="pct", y="option", orientation="h",
         category_orders={"option": order[::-1]}, custom_data=["n"],

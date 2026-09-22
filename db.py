@@ -1153,24 +1153,26 @@ def list_participant_survey_rows() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def save_task_instruction(
-    task_key: str, content: str, title: str | None = None
+    task_key: str, content: str, title: str | None = None, notebook_html: str | None = None
 ) -> tuple[bool, str | None]:
     """Upsert the instruction document for one task screen. `task_key` is one of
     lib.tasks.INSTRUCTION_KEYS; `content` is markdown shown to the participant
-    verbatim."""
+    verbatim. `notebook_html` is set only for the debug_notebook row (the
+    rendered buggy notebook, lib.notebook.notebook_to_html) -- omitted (not
+    overwritten to null) for every other save."""
     client = get_supabase_client()
     if client is None:
         return False, "Database not configured (SUPABASE_URL/SUPABASE_KEY not set)."
+    row = {
+        "task_key": task_key,
+        "title": (title or "").strip() or None,
+        "content": content,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if notebook_html is not None:
+        row["notebook_html"] = notebook_html
     try:
-        client.table("task_instructions").upsert(
-            {
-                "task_key": task_key,
-                "title": (title or "").strip() or None,
-                "content": content,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            on_conflict="task_key",
-        ).execute()
+        client.table("task_instructions").upsert(row, on_conflict="task_key").execute()
         return True, None
     except Exception as e:
         return False, str(e)

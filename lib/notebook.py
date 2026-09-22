@@ -1,4 +1,4 @@
-"""Flatten a Jupyter notebook into a plain-text transcript.
+"""Flatten a Jupyter notebook into a plain-text transcript, or render it as HTML.
 
 Shared by the quiz (question generation) and the grader (rubric scoring), which
 previously each carried their own identical copy of this function.
@@ -7,6 +7,7 @@ previously each carried their own identical copy of this function.
 import re
 
 import nbformat
+from nbconvert import HTMLExporter
 
 MAX_OUTPUT_CHARS_PER_CELL = 1500
 
@@ -49,3 +50,27 @@ def notebook_to_text(raw: bytes) -> str:
             if out_texts:
                 parts.append(f"--- output of cell {i} ---\n" + "\n".join(out_texts))
     return "\n\n".join(parts)
+
+
+def notebook_to_html(raw: bytes) -> str:
+    """Render a .ipynb as a single self-contained HTML page, for the participant
+    to view (a new browser tab, not the app itself) while debugging it.
+
+    A small "Cell N" label is inserted before every cell, using the same 0-based,
+    every-cell-type numbering as notebook_to_text's `--- ... cell N ---` markers --
+    so a cell number in a write-up or an answer key points at the same cell here
+    as it does in grading.
+    """
+    nb = nbformat.reads(raw.decode("utf-8"), as_version=4)
+    labeled = []
+    for i, cell in enumerate(nb.cells):
+        label = nbformat.v4.new_markdown_cell(f"**Cell {i}**")
+        label.metadata["tags"] = ["cell-label"]
+        labeled.append(label)
+        labeled.append(cell)
+    nb.cells = labeled
+    exporter = HTMLExporter(template_name="classic")
+    exporter.exclude_input_prompt = True
+    exporter.exclude_output_prompt = True
+    body, _ = exporter.from_notebook_node(nb)
+    return body

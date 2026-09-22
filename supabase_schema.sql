@@ -401,4 +401,12 @@ create table if not exists participant_task_grades (
 
 alter table participant_task_grades enable row level security;
 
+-- Rendered HTML of the buggy notebook (lib.notebook.notebook_to_html), set
+-- alongside task_instructions.content (the flattened text used for grading)
+-- when the admin uploads/replaces the debug_notebook row. Null for every other
+-- task_key. The participant's Debug task screen offers it as an "open in a new
+-- tab" link -- the debugging task now shows the actual buggy notebook, not just
+-- a written description of it.
+alter table task_instructions add column if not exists notebook_html text;
+
 notify pgrst, 'reload schema';

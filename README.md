@@ -139,12 +139,19 @@ Password gate (`ADMIN_PASSWORD`). Seven tabs:
    (`lib/survey_stats.py`): coverage and timing, pre→post knowledge gain scored
    against `lib.surveys.ANSWER_KEY`, attitude shift, workload, self-assessed vs
    rubric grade, background, free text, and a long-format CSV export.
-5. **Task instructions** — upload the markdown each task screen shows: one
-   main-task document per condition (slow planning / slow iterating / control)
-   plus the shared ideation and debugging ones. **Upload all five before running
-   anyone** — a task with no document cannot be started. Below them, the grading material (admin only):
-   the **debugging** buggy `.ipynb` and the **ideation rubric**. A participant's Debug
-   sub-tab then autogrades their write-up (`lib/debug_grading.py`): Opus 5 reads the
+5. **Task instructions** — upload the markdown each task screen shows: a shared
+   main-task **brief** (the task itself, same for every condition) plus one
+   main-task **condition instructions** document per condition (slow planning /
+   slow iterating / control), shown to the participant on the same page as the
+   brief, plus the shared ideation and debugging ones. **Upload all six before
+   running anyone** — a task with a missing document cannot be started. Below
+   them, the grading/reference material: the **debugging** buggy `.ipynb` and
+   the **ideation rubric**. Uploading the buggy notebook also renders it to
+   HTML (`lib/notebook.py`'s `notebook_to_html`, stored in
+   `task_instructions.notebook_html`); the participant's Debugging task screen
+   links to it as an "open in a new tab" page, so they debug the actual
+   notebook, not just a description of it. A participant's Debug sub-tab then
+   autogrades their write-up (`lib/debug_grading.py`): Opus 5 reads the
    notebook and the write-up, and each bug the participant reported scores +1 if it is
    a real bug and +1 if the fix is valid (so the max is 2 × bugs reported). Their Ideate sub-tab
    grades the pitch transcript against the rubric, read verbatim
@@ -174,7 +181,9 @@ Tables (`supabase_schema.sql`):
 - `participant_quiz` — the comprehension-quiz result + per-question breakdown
 - `participant_surveys` — the pre/post survey responses + per-item timing
 - `participant_task_timings` — when each timed task was started and finished
-- `task_instructions` — the admin-authored markdown for each task screen
+- `task_instructions` — the admin-authored markdown for each task screen, plus
+  `notebook_html` on the `debug_notebook` row (the buggy notebook rendered to
+  HTML for the participant to view)
 - `participant_logs` — the raw session `.jsonl` + derived metrics
 - `participant_transcripts` — the admin-uploaded verbal-assessment `.txt` + its
   parsed timestamped Q/A pairs
